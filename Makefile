@@ -40,6 +40,19 @@ runomp: run.c
 win64:
 	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -o run.exe -I. run.c win.c
 	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -o runq.exe -I. runq.c win.c
+	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -o runq_embedded.exe -I. runq_embedded.c win.c -lm
+
+.PHONY: runwin
+runwin:
+	$(CC) -Ofast -D_WIN32 -o run.exe -I. run.c win.c
+	$(CC) -Ofast -D_WIN32 -o runq.exe -I. runq.c win.c
+
+.PHONY: runembedded
+runembedded: runq_embedded.c
+	$(CC) -Ofast -D_WIN32 -o runq_embedded.exe -I. runq_embedded.c win.c -lm
+
+.PHONY: runembeddedwin
+runembeddedwin: runembedded
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: rungnu
@@ -74,3 +87,5 @@ testcc:
 clean:
 	rm -f run
 	rm -f runq
+	rm -f runq_embedded
+	rm -f *.exe

@@ -489,7 +489,7 @@ def load_hf_model(model_path):
 # -----------------------------------------------------------------------------
 # API entrypoint
 
-def model_export(model, filepath, version, dtype=torch.float32):
+def model_export(model, filepath, version, dtype=torch.float32, group_size=64):
     """
     Versions docs:
     v-1:huggingface export, i.e. intended for use outside of this repo, in HF
@@ -503,9 +503,9 @@ def model_export(model, filepath, version, dtype=torch.float32):
     elif version == 1:
         version1_export(model, filepath)
     elif version == 2:
-        version2_export(model, filepath)
+        version2_export(model, filepath, group_size=group_size)
     elif version == -1:
-        hf_export(model, filepath, dtype)
+        hf_export(model, filepath, group_size=group_size, dtype=dtype)
     else:
         raise ValueError(f"unknown version {version}")
 
@@ -546,6 +546,7 @@ if __name__ == "__main__":
     parser.add_argument("filepath", type=str, help="the output filepath")
     parser.add_argument("--version", default=0, type=int, help="the version to export with")
     parser.add_argument("--dtype", type=str, help="dtype of the model (fp16, fp32)", default="fp32")
+    parser.add_argument("--group-size", default=64, type=int, help="group size used for version 2 quantization")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--checkpoint", type=str, help="model checkpoint, .pt file")
     group.add_argument("--meta-llama", type=str, help="meta llama model path")
@@ -564,4 +565,4 @@ if __name__ == "__main__":
         parser.error("Can't load input model!")
 
     # export
-    model_export(model, args.filepath, args.version, args.dtype)
+    model_export(model, args.filepath, args.version, args.dtype, args.group_size)

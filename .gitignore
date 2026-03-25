@@ -1,0 +1,15 @@
+artifacts/
+*.exe
+embedded_out*.txt
+file_out.txt
+/.artifacts/
+__pycache__/
+*.pyc
+*.obj
+*.o
+*.exe
+run
+runq
+runq_embedded
+err.txt
+stdout.txt

@@ -56,3 +56,25 @@ After they finished getting, Timmy's dad came up to his house and promised to he
 ```
 
 Hey you can't expect too much from a 260K parameter model. I'm even mildly shocked we get this far :D
+
+## embedded runq on Windows
+
+This repository now also supports an embedded `runq` flow for no-filesystem targets.
+The workflow is:
+
+```bash
+D:\anaconda3\python.exe tools\generate_embedded_stories260k.py
+make runembeddedwin
+.\runq_embedded.exe -t 0.0 -n 200
+```
+
+The generation script downloads the official `stories260K.pt` checkpoint and
+`tok512.model`, exports the quantized version-2 checkpoint expected by
+`runq.c`, uses `group_size=32` to match the OpenLA500 260K reference, and then
+converts both `.bin` files into headers using `xxd`.
+
+Generated headers land in `embedded/stories260K/` and are consumed by
+`runq_embedded.c`, which keeps the original quantized inference path but loads
+the model and tokenizer from static arrays instead of `fopen`/`mmap`.
+
+For a Chinese implementation log of this work, see [runq_embedded_zh.md](runq_embedded_zh.md).
