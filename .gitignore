@@ -1,4 +1,5 @@
 artifacts/
+quant_eval/
 *.exe
 embedded_out*.txt
 file_out.txt
