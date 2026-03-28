@@ -283,3 +283,116 @@ V1 建议下放硬件：
   - classifier 与 norm/softmax 保留更高精度或轻量动态
 - 但当前 `post_engine` 的数值边界还不够，需要围绕“不要过早压回 `s8`、把 `RMSNorm` 做稳、接口从 softmax 专用改成通用 post”做最小修改。
 - 不建议 V1 继续追求完全兼容 `runq.c` 的动态 group activation 量化。那会显著提高硬件复杂度，而不是提高系统落地概率
+
+## 执行图对齐 QAT 进展
+
+本轮新增了一条不同于 coarse-op 路线的软件探索：
+
+- `tools/qat_exec_graph_explore.py`
+- `tools/qat_exec_graph_train.py`
+- `doc/exec_graph_qat_exploration_zh.md`
+
+这条路线的目标不是先定义 coarse-op descriptor，而是先验证：
+
+- 如果软件侧显式模拟
+  - `INT8(per-token A) x INT8(per-row W)`
+  - `ACC32_RAW`
+  - `MID16`
+  - `RMSNorm / SOFTMAX_ROW`
+- 再用 `QAT + 蒸馏` 去适配这张更接近真实硬件执行图的训练图，
+- student 是否能在较小硬件改动前提下收敛到更适合现有数据通路的解。
+
+当前结论如下：
+
+### 1. `LINEAR + ACC32_RAW + MID16` 是可训练的
+
+在 GPU 上，`linear_only` 路线用更长训练后：
+
+- `42M teacher` 语料 teacher：
+  - `cosine`
+    - 从短训练的 `0.8943`
+    - 提升到 `0.9399`
+- `260K teacher` 语料 teacher：
+  - 在同等 `192` 步长训下可到 `0.9549`
+- 真实 `TinyStories custom-512` 数据流下：
+  - `linear_only` 长训已可到 `0.9586 ~ 0.9675`
+
+这说明：
+
+- 线性主数据通路存在继续训练的收益
+- 当前 `0.8943` 不是这条路线的上限
+- 在当前 260K student 场景下，更大的 teacher 不是第一瓶颈；训练预算本身同样重要
+- 真实数据流比 fallback 小语料更关键
+
+### 2. 当前主瓶颈仍然是 `RMSNorm/post`
+
+更深入排查后发现，前一版 `RMSNorm` 训练代理存在量纲错误：
+
+- 在整数域求出的 `inv_std` 已经隐含了 `input_scale`
+- 最终输出又额外乘了一次 `input_scale`
+
+这会把 `RMSNorm` 输出整体压坏。
+
+修正这个问题后，再跑 GPU 训练：
+
+- `260K teacher` 路线：
+  - `+norm` 后 `cosine = 0.9199`
+  - `+softmax` 后 `cosine = 0.9225`
+- `42M teacher` 语料 teacher 路线：
+  - `+norm` 后 `cosine = 0.9270`
+  - `+softmax` 后 `cosine = 0.9209`
+
+这说明：
+
+- 先前掉到 `~0.49` 的结果，并不完全代表“硬件路线不可行”
+- 更准确地说，主问题首先是 `RMSNorm/post` 的量纲和数学定义不对
+- 修正后，完整执行图训练已经能进入 `0.92x` 区间
+- 在真实 `TinyStories custom-512` 数据和长训下：
+  - `+norm` 可到 `0.9707 ~ 0.9713`
+  - `+softmax` 仍能保持在 `0.9473 ~ 0.9518`
+- 当前主问题已从“整链会崩”转成“生成质量还需继续优化”
+- demo 已从“乱码”进入“可读但重复和实体漂移仍较重”的阶段
+
+### 3. softmax 不是当前第一矛盾
+
+从最新训练结果看：
+
+- 在修正过的 `norm` 代理下，`+softmax` 没有把结果再明显拉坏
+- 因此当前仍应优先把 `norm` 做稳，再继续细化 softmax
+
+因此当前优先级是：
+
+1. 保持当前修正后的 `RMSNorm/post` 路线
+2. 继续在真实数据上提升生成质量
+3. 再看是否需要进一步细化 softmax
+
+### 4. 大 teacher 有帮助，但不能掩盖 `norm/post` 问题
+
+`42M teacher` 通过更强语料，对线性阶段是有帮助的；但在同等长训下，它并没有明显超过 `260K teacher`。在修正过的 `norm` 代理下，它也只是略优于 `260K teacher`，差距不大。
+
+因此当前判断是：
+
+- 更大 teacher 值得继续用
+- 但主矛盾仍是 `norm/post` 数学，而不是 teacher 太弱
+- 如果后续继续扩大 teacher 规模，收益大概率也会弱于先把 `norm/post` 做稳
+
+### 5. 当前最有效的生成质量提升路线
+
+在真实 `TinyStories custom-512` 数据流上继续迭代后，当前更适合继续打磨 demo 的主线已经比较明确：
+
+- `official_ce_push`
+- `improved norm`
+- `improved softmax`
+- `repetition penalty`
+- `sampled demo`
+
+代表结果：
+
+- `artifacts/qat_exec_graph_train_task_260k_officialce768_topp_demo.json`
+- `artifacts/qat_exec_graph_train_task_260k_finalpolishstrong768_demo.json`
+
+这说明：
+
+- 对 260K 这类小模型，后期训练更贴近原项目的 `CE` 目标，比继续强化蒸馏更有利于生成质量
+- 轻量反重复损失能进一步压住模板化和连续重复
+- 真正用于展示时，应以 `sampled` 结果为主，而不是只看 greedy

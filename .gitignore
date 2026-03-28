@@ -14,3 +14,4 @@ runq
 runq_embedded
 err.txt
 stdout.txt
+data/*
