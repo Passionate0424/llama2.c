@@ -262,6 +262,9 @@ def build_mixed_text_task_batch_iter(...):
 - `artifacts/qat_exec_graph_train_task_260k_officialce768_topp_demo.json`
 - `artifacts/demo_sampling_sweep_officialce768.json`
 - `artifacts/qat_exec_graph_train_task_mix42m_officialce768_demo.json`
+- `artifacts/qat_exec_graph_train_task_260k_finalpolishstrong768_demo.json`
+- `artifacts/demo_sampling_sweep_finalpolishstrong768.json`
+- `artifacts/qat_exec_graph_train_task_260k_finalpolishstrong1280_demo.json`
 
 ## 结果摘要
 
@@ -547,6 +550,31 @@ def build_mixed_text_task_batch_iter(...):
 - 从该配置继续做 sampled demo 输出：
   - `top-p = 0.9` 的 sampled 文本明显比 greedy 更自然
 
+进一步从该配置的最佳阶段 checkpoint 做两组低学习率 `CE-only` 精修后，重新核对 artifact 可得：
+
+- `artifacts/qat_exec_graph_train_task_260k_finalpolish768_demo.json`
+  - `cosine = 0.9737`
+  - `distinct1 = 0.2948`
+  - `distinct2 = 0.5217`
+  - `max_repeat_run = 1`
+- `artifacts/qat_exec_graph_train_task_260k_finalpolishstrong768_demo.json`
+  - `cosine = 0.9710`
+  - `distinct1 = 0.2139`
+  - `distinct2 = 0.3768`
+  - `max_repeat_run = 2`
+- `artifacts/qat_exec_graph_train_task_260k_finalpolishstrong1280_demo.json`
+  - `cosine = 0.9693`
+  - `distinct1 = 0.2543`
+  - `distinct2 = 0.4696`
+  - `max_repeat_run = 2`
+
+这说明：
+
+- 低学习率 `CE-only` 精修本身是有效的
+- 但 `final_polish_strong` 并不天然优于 `final_polish`
+- 当前看更强的 `rep_weight/window` 有“压住重复，同时压掉一部分故事活性”的迹象
+- 因此后续更值得优先围绕 `final_polish` 或 `seq_len` 单变量继续微调，而不是默认继续加大反重复强度
+
 ### 10. sampled demo 明显优于 greedy demo
 
 在加入 sampled demo 评估后发现：
@@ -573,6 +601,427 @@ def build_mixed_text_task_batch_iter(...):
 - 更少的模板化重复
 - 不会像高温采样那样明显跑偏
 
+在 `final_polish_strong` checkpoint 上继续做第二轮精细扫表后：
+
+- `0.95 / 0.90 / 40`
+- `0.92 / 0.90 / 40`
+- `0.95 / 0.88 / 40`
+
+都表现不错，其中：
+
+- `0.95 / 0.90 / 40` 最均衡
+- `0.92 / 0.90 / 40` 更稳一些
+- `0.95 / 0.88 / 40` 对偶发跑偏更克制
+
+因此当前推荐可以固化为：
+
+1. 主演示：`temperature=0.95, top-p=0.9, top-k=40`
+2. 稳妥版：`temperature=0.92, top-p=0.9, top-k=40`
+
+### 11. 评估口径补强：训练脚本 sampled demo 现已对齐 `top-p + top-k`
+
+在继续做 demo 打磨时，又确认了一个容易误导判断的小问题：
+
+- 之前训练脚本里的 sampled demo helper 只真正使用了 `top-p`
+- `top-k=40` 虽然写在配置里，但没有进实际采样逻辑
+
+这个问题现已修正：
+
+- `tools/qat_exec_graph_train.py`
+  - sampled demo 默认口径改为 `temperature=0.95, top-p=0.9, top-k=40`
+  - 训练日志里的 sampled demo 已真正执行 `top-p + top-k`
+- `tools/eval_demo_sampling.py`
+  - 与训练脚本保持相同采样语义
+  - 新增更面向生成质量的统计项：
+    - `distinct3`
+    - `repeat_bigram_ratio`
+    - `repeat_trigram_ratio`
+    - `tail_loop_ratio`
+
+这意味着后续再看 demo，不再只是看：
+
+- `cosine`
+- `distinct1`
+- `distinct2`
+
+还会同时观察：
+
+- 是否存在更细粒度的 n-gram 回环
+- 句尾是否容易掉进局部循环
+
+### 12. 最新 sampled sweep 复核
+
+在当前最佳 checkpoint 上，又做了一轮独立 CPU sweep：
+
+- `artifacts/demo_sampling_sweep_finalpolishstrong768_v5_cpu.json`
+
+测试口径包括：
+
+- `0.95 / 0.90 / 40`
+- `0.92 / 0.90 / 40`
+- `0.95 / 0.88 / 40`
+- `0.90 / 0.92 / 32`
+- `1.00 / 0.90 / 40`
+
+这轮结果仍然支持此前的判断：
+
+- `0.95 / 0.90 / 40`
+  - 综合最均衡
+  - `distinct2 = 0.7545`
+  - `distinct3 = 0.8869`
+  - `repeat_trigram_ratio = 0.1131`
+- `1.00 / 0.90 / 40`
+  - 语言活性略高
+  - `distinct1 = 0.2945`
+  - `distinct3 = 0.8988`
+  - 但个别样本更容易跑偏
+- `0.92 / 0.90 / 40`
+  - 更稳
+  - 但整体展开会稍保守一些
+
+额外一个好现象是：
+
+- 当前这组 sweep 的 `tail_loop_ratio` 均为 `0.0`
+
+这说明：
+
+- 当前最佳 checkpoint 在 sampled 口径下，至少没有明显掉进“句尾短回环”这一类非常影响 demo 观感的问题
+
+### 13. `seq_len=256` 精修验证：值得保留，但不要继续“训过头”
+
+在此前 `seq_len=256` 的官方训练分支之后，又补做了一轮直接从最佳 `seq256 strong` checkpoint 继续精修的验证。
+
+先看 `seq256 strong` 本身：
+
+- `artifacts/qat_exec_graph_train_task_260k_finalpolishstrong_seq256_demo.json`
+  - `cosine = 0.9718`
+  - `distinct1 = 0.2803`
+  - `distinct2 = 0.5333`
+  - `max_repeat_run = 1`
+
+再看 sampled 口径：
+
+- `artifacts/demo_sampling_sweep_finalpolishstrong_seq256_v1_cpu.json`
+  - `0.95 / 0.90 / 40`
+    - `distinct1 = 0.2866`
+    - `distinct2 = 0.7861`
+    - `distinct3 = 0.9127`
+    - `repeat_trigram_ratio = 0.0873`
+  - 相比之前 `seq128 strong` 的
+    - `artifacts/demo_sampling_sweep_finalpolishstrong768_v5_cpu.json`
+    - `0.95 / 0.90 / 40`
+      - `distinct2 = 0.7545`
+      - `distinct3 = 0.8869`
+      - `repeat_trigram_ratio = 0.1131`
+
+这说明：
+
+- `seq_len=256` 的这条强精修路线，在 sampled demo 上确实比 `seq_len=128` 更好
+- 改善主要体现在：
+  - 更高的二元/三元多样性
+  - 更低的 trigram 重复
+  - 没有明显句尾回环
+
+### 14. 从 `seq256 strong` 继续做更温和 `final_polish`：本轮结论为负收益
+
+为了验证“是不是把强反重复放松一点会更自然”，又做了一轮：
+
+- `artifacts/qat_exec_graph_train_task_260k_finalpolish_seq256_fromstrong384_demo.json`
+
+配置是：
+
+- 从 `seq256 strong` checkpoint 继续
+- `final_polish`
+- `rep_weight = 0.2`
+- `rep_window = 24`
+- `384` steps
+- `lr = 5e-6`
+
+结果并不好：
+
+- `cosine = 0.9684`
+- `distinct1 = 0.2514`
+- `distinct2 = 0.4667`
+- `distinct3 = 0.5581`
+
+对应 sampled sweep：
+
+- `artifacts/demo_sampling_sweep_finalpolish_seq256_fromstrong384_v1_cpu.json`
+  - `0.95 / 0.90 / 40`
+    - `distinct2 = 0.7485`
+    - `distinct3 = 0.8770`
+    - `repeat_trigram_ratio = 0.1230`
+
+与 `seq256 strong` 相比：
+
+- 多样性下降
+- trigram 重复回升
+- 没有换来更好的长程观感
+
+因此这轮可以明确记为：
+
+- `继续从 seq256 strong 做更温和 CE-only 精修`，当前看不是优先方向
+
+### 15. `seq256 strong` 的细粒度 sampled sweep
+
+为了确认 `seq256 strong` 上的展示口径，又做了一轮更细 sweep：
+
+- `artifacts/demo_sampling_sweep_finalpolishstrong_seq256_v2_cpu.json`
+
+测试了：
+
+- `0.97 / 0.90 / 40`
+- `0.93 / 0.90 / 40`
+- `0.95 / 0.90 / 40`
+- `0.95 / 0.92 / 40`
+- `0.95 / 0.90 / 48`
+- `1.00 / 0.88 / 40`
+
+这轮的结论比之前更具体：
+
+- 若优先追求活性与总体展开：
+  - `0.97 / 0.90 / 40`
+  - `distinct2 = 0.7485`
+  - `repeat_trigram_ratio = 0.1091`
+  - 但 `tail_loop_ratio = 0.0833`
+- 若优先追求稳妥演示：
+  - `0.93 / 0.90 / 40`
+  - `distinct2 = 0.7386`
+  - `repeat_trigram_ratio = 0.1131`
+  - `tail_loop_ratio = 0.0`
+
+因此当前 `seq256 strong` 的 sampled 口径建议应修正为：
+
+1. 主演示稳妥版：`temperature=0.93, top-p=0.9, top-k=40`
+2. 活跃版备选：`temperature=0.97, top-p=0.9, top-k=40`
+3. 不建议优先继续提高 `top_p` 或放宽 `top_k`
+
+### 16. 长输出 demo 验证
+
+为了判断更长展示长度是否还能稳定，又做了一轮 `200` 新 token 的直接验证：
+
+- `artifacts/demo_sampling_sweep_finalpolishstrong_seq256_long200_v1_cpu.json`
+
+在原始 `seq256 strong` checkpoint 上，结果是：
+
+- `0.95 / 0.90 / 40`
+  - `distinct2 = 0.6630`
+  - `distinct3 = 0.8677`
+  - `repeat_trigram_ratio = 0.1323`
+  - `tail_loop_ratio = 0.0`
+- `0.97 / 0.90 / 40`
+  - `distinct2 = 0.6594`
+  - `repeat_trigram_ratio = 0.1626`
+  - `tail_loop_ratio = 0.0`
+
+这说明：
+
+- 到 `200` token 量级时，全局多样性会明显回落
+- 但至少还没有明显掉进尾部短回环
+- 如果做现场 demo，主展示长度仍应控制在 `120~160` 新 token
+
+### 17. 原始 `seq256 strong` checkpoint 继续做超低学习率强约束续训，收益有限但对长输出略有帮助
+
+为了确认“顺着当前最优方向再补一点训练量”是否还有收益，又做了一轮：
+
+- `artifacts/qat_exec_graph_train_task_260k_finalpolishstrong_seq256_lowlr128_demo.json`
+- `artifacts/demo_sampling_sweep_finalpolishstrong_seq256_lowlr128_v1_cpu.json`
+- `artifacts/demo_sampling_sweep_finalpolishstrong_seq256_lowlr128_long200_v1_cpu.json`
+
+配置是：
+
+- 仍然使用 `final_polish_strong`
+- `lr = 2e-6`
+- `steps = 128`
+- 从原始 `seq256 strong` checkpoint 继续
+
+这轮训练后的 `final_eval` 为：
+
+- `cosine = 0.9701`
+- `distinct1 = 0.2370`
+- `distinct2 = 0.4638`
+- `repeat_trigram_ratio = 0.4186`
+
+也就是说：
+
+- 单看训练内 greedy/聚合统计，并没有变好
+
+但独立 sampled sweep 里又出现了一个更细的现象：
+
+- 在 `120` token 口径下：
+  - `0.95 / 0.90 / 40`
+  - `distinct2 = 0.7426`
+  - `repeat_trigram_ratio = 0.1190`
+  - `tail_loop_ratio = 0.0`
+- 在 `200` token 口径下：
+  - `0.95 / 0.90 / 40`
+  - `distinct2 = 0.6727`
+  - `repeat_trigram_ratio = 0.1299`
+  - `tail_loop_ratio = 0.0`
+
+与原始 `seq256 strong` 相比：
+
+- 对 `120` token 的短展示，它并没有稳定打赢原始 checkpoint
+- 但对 `200` token 的更长输出，它略有改善
+
+因此当前更合理的收敛结论是：
+
+- 原始 `seq256 strong` 仍然保留为主展示版本
+- 若确实要做更长一点的连续展示，可以把 `lowlr128` 版本作为备选
+- `继续 strong 小步续训` 不是最高优先级，但也不是完全没有价值
+
+### 18. 解码侧约束探索：`repetition penalty` 带来的收益高于继续小步训练
+
+在训练收益已经开始边际递减后，又补做了一轮“只改解码、不改 checkpoint”的探索。
+
+为此扩展了：
+
+- `tools/eval_demo_sampling.py`
+
+现在这个脚本除了原有的：
+
+- `top-p`
+- `top-k`
+
+还支持：
+
+- `repetition_penalty`
+- `no_repeat_ngram_size`
+
+相关实验结果：
+
+- `artifacts/demo_sampling_sweep_seq256_rep105_v1_cpu.json`
+- `artifacts/demo_sampling_sweep_seq256_rep110_v1_cpu.json`
+- `artifacts/demo_sampling_sweep_seq256_ngram3_v1_cpu.json`
+- `artifacts/demo_sampling_sweep_seq256_rep105_ngram3_v1_cpu.json`
+- `artifacts/demo_sampling_sweep_seq256_rep110_long180_v1_cpu.json`
+- `artifacts/demo_sampling_sweep_seq256_rep105_ngram3_long180_v1_cpu.json`
+
+先看单独加 `repetition penalty`：
+
+- `rep=1.05, 0.93 / 0.90 / 40`
+  - `distinct2 = 0.7406`
+  - `distinct3 = 0.8948`
+  - `repeat_trigram_ratio = 0.1052`
+- `rep=1.10, 0.93 / 0.90 / 40`
+  - `distinct2 = 0.8020`
+  - `distinct3 = 0.9067`
+  - `repeat_trigram_ratio = 0.0933`
+
+相较于此前不加这类约束的原始推荐口径：
+
+- `0.93 / 0.90 / 40`
+  - `distinct2 = 0.7386`
+  - `distinct3 = 0.8869`
+  - `repeat_trigram_ratio = 0.1131`
+
+可以看到：
+
+- 轻度到中度 `repetition penalty` 确实在改善 demo 侧的重复问题
+- 它带来的收益已经不只是统计好看，样本文本也更少出现“短模板原地打转”
+
+### 19. `repetition penalty + no-repeat trigram` 是当前最有希望的 demo 解码口径
+
+进一步又尝试了组合约束：
+
+- `rep=1.05`
+- `no_repeat_ngram_size=3`
+
+其中比较均衡的一档是：
+
+- `temperature=0.93`
+- `top_p=0.9`
+- `top_k=40`
+
+在 `120` token 口径下：
+
+- `distinct2 = 0.7683`
+- `distinct3 = 0.9167`
+- `repeat_trigram_ratio = 0.0833`
+- `tail_loop_ratio = 0.0`
+
+在 `180` token 口径下：
+
+- `distinct2 = 0.7463`
+- `distinct3 = 0.9153`
+- `repeat_trigram_ratio = 0.0847`
+- `tail_loop_ratio = 0.0`
+
+这说明：
+
+- “轻度 repetition penalty + no-repeat trigram” 对当前 `260K` 小模型是有效的
+- 即使把输出拉长到 `180` token，仍没有明显掉进尾部短循环
+- 这条线当前比“继续小步训练”更值得优先打磨
+
+因此当前可以新增一条更强的展示建议：
+
+1. 主演示增强稳妥版：`temperature=0.93, top-p=0.9, top-k=40, repetition_penalty=1.05, no_repeat_ngram_size=3`
+2. 更活跃版：`temperature=0.93, top-p=0.9, top-k=40, repetition_penalty=1.10`
+3. 不建议默认继续把 penalty 一味加大，因为对 tiny 模型来说过强约束也会让文本发散感上升
+
+### 20. prompt bank 也值得和解码口径一起固定
+
+为了减少“同一模型、同一参数，但不同 prompt 观感差很多”的问题，又做了一轮 prompt bank 试探：
+
+- `artifacts/demo_promptbank_seq256_rep110_v1.json`
+- `artifacts/demo_prompt_eval_seq256_rep105_ng3_v1.json`
+
+其中更贴近当前默认展示口径的是：
+
+- `temperature=0.93`
+- `top-p=0.9`
+- `top-k=40`
+- `repetition_penalty=1.05`
+- `no_repeat_ngram_size=3`
+
+相对更适合作为 demo 开场的 prompt 包括：
+
+- `Once upon a time`
+- `Ben opened the box and`
+- `Tom was happy because`
+- `Timmy went to the park and found`
+- `One day, Lily found a little bird and`
+- `Ben wanted to help his friend, so`
+- `Lily and Tim went to the park because`
+- `The boy opened the box and saw`
+
+这些 prompt 的共同特点是：
+
+- 先给角色
+- 再给动作起点
+- 更贴近 TinyStories 的短故事分布
+
+因此后续如果要做稳定展示，不应只固化 checkpoint 和采样参数，也应同时固化 prompt 集合。
+
+### 21. 已补一键展示脚本，便于直接复现当前最佳 demo
+
+为了把当前阶段的最佳 checkpoint、最佳解码口径和 prompt 集合收束成可直接复用的入口，又新增了：
+
+- `tools/run_demo_showcase.py`
+
+这个脚本当前已经内置：
+
+- `enhanced` 预设
+  - `temperature=0.93`
+  - `top-p=0.9`
+  - `top-k=40`
+  - `repetition_penalty=1.05`
+  - `no_repeat_ngram_size=3`
+- `natural` 预设
+- `best / stable / story` 三组 prompt
+
+对应当前一份直接可展示的产物：
+
+- `artifacts/demo_showcase_seq256_best_story_v1.json`
+
+这意味着现在再做 demo，不需要重新手工拼参数，只要：
+
+- 固定 checkpoint
+- 固定 preset
+- 固定 prompt set
+
+就可以稳定复现当前较优的展示效果。
+
 ## 当前判断
 
 目前可以比较明确地下结论：
@@ -580,17 +1029,30 @@ def build_mixed_text_task_batch_iter(...):
 1. 这条“执行图对齐的 `QAT + 蒸馏` 路线”是成立的
 2. `LINEAR + ACC32_RAW + MID16` 主路径值得继续投入训练
 3. 在修正量纲后，`RMSNorm/post` 已不再是“整链会崩”的主瓶颈，已经进入可用区间
-4. 当前最主要的剩余问题是生成质量：重复、实体漂移、情节推进弱
-5. 增加训练轮次对线性阶段和完整执行图都有效，但收益已开始进入边际改善阶段
+4. 当前最主要的剩余问题仍然是生成质量，但优化重点已经从“能不能训稳”转向“怎样把最佳 checkpoint 展示得更像样”
+5. `seq_len=256` 是目前最值得保留的单变量改进之一，已经从“值得试”升级为“当前主候选”
+6. 从 `strong` checkpoint 再切回温和 `final_polish`，本轮没有带来更好 demo，说明这不是当前第一优先方向
+7. 当前如果以 `sampled` 口径展示，效果已经可以进入“较好演示候选”，其中原始 `seq256 strong` checkpoint 是当前最值得保留的主展示版本
+8. 对 `120~160` 新 token 的展示，当前更高收益的是展示参数、prompt 与解码约束打磨；对更长展示，`lowlr128 strong` 可以作为一个备选 checkpoint
+9. 当前最值得继续沿用的新增技巧是：
+   - `repetition_penalty`
+   - 轻量 `no_repeat_ngram`
+10. 当前最适合优先固化的展示口径是：
+   - 稳妥版：`0.93 / 0.90 / 40 + repetition_penalty=1.05 + no_repeat_ngram_size=3`
+   - 活跃版：`0.93 / 0.90 / 40 + repetition_penalty=1.10`
+11. 当前已经具备进入“demo 成品化”的条件：checkpoint、解码 preset、prompt set 和展示脚本都可以开始固化
 
 ## 下一步
 
 下一步建议按这个顺序推进：
 
-1. 继续在真实 `TinyStories custom-512` 数据上长训
-2. 重点从“数值可行性”转到“生成质量提升”
-3. 优先尝试：
-   - 更长完整执行图训练
-   - teacher 文本混入比例调整
-   - 更贴近 demo 的训练/评估策略
-4. `norm_v2` 和 `softmax_v2` 仍可继续细化，但它们现在已经不是唯一主线
+1. 以原始 `seq256 strong` 作为当前主展示 checkpoint，优先继续做 sampled 参数、prompt 和解码约束打磨
+2. 演示时以 sampled 结果为主，greedy 只作稳定性口径
+3. 若继续提升，优先做：
+   - 更细的 sampled 参数打磨
+   - `repetition_penalty / no_repeat_ngram` 的展示口径固化
+   - prompt 选择与展示脚本打磨
+   - demo 成品化：固定一套默认展示 JSON / 命令行入口
+   - 更长 token demo 验证，但现场展示仍控制在 `120~160` 新 token
+   - 仅在需要更长连续输出时，再考虑启用 `lowlr128 strong` 这一备选 checkpoint
+4. `norm_v2` 和 `softmax_v2` 仍可继续细化，但它们已不是当前第一主线

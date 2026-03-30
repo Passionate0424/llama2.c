@@ -40,9 +40,18 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str) -> Transformer
 
 def distinct_stats(ids: List[int]) -> dict:
     if not ids:
-        return {"distinct1": 0.0, "distinct2": 0.0, "max_repeat_run": 0}
+        return {
+            "distinct1": 0.0,
+            "distinct2": 0.0,
+            "distinct3": 0.0,
+            "max_repeat_run": 0,
+            "repeat_bigram_ratio": 0.0,
+            "repeat_trigram_ratio": 0.0,
+            "tail_loop_ratio": 0.0,
+        }
     unigrams = set(ids)
     bigrams = set(zip(ids, ids[1:])) if len(ids) > 1 else set()
+    trigrams = set(zip(ids, ids[1:], ids[2:])) if len(ids) > 2 else set()
     max_run = 1
     cur = 1
     for i in range(1, len(ids)):
@@ -51,10 +60,36 @@ def distinct_stats(ids: List[int]) -> dict:
             max_run = max(max_run, cur)
         else:
             cur = 1
+
+    # 用重复 n-gram 比例观察“故事看似不坏，但在局部循环打转”的问题。
+    bigram_total = max(0, len(ids) - 1)
+    trigram_total = max(0, len(ids) - 2)
+    repeat_bigram_ratio = 0.0
+    repeat_trigram_ratio = 0.0
+    if bigram_total > 0:
+        repeat_bigram_ratio = 1.0 - (len(bigrams) / bigram_total)
+    if trigram_total > 0:
+        repeat_trigram_ratio = 1.0 - (len(trigrams) / trigram_total)
+
+    # 句尾回环启发式：看最后 24 token 中，后半段与前半段重复多少。
+    tail_loop_ratio = 0.0
+    tail_span = min(24, len(ids))
+    if tail_span >= 8:
+        tail = ids[-tail_span:]
+        half = tail_span // 2
+        prefix = tail[:half]
+        suffix = tail[-half:]
+        matches = sum(1 for a, b in zip(prefix, suffix) if a == b)
+        tail_loop_ratio = matches / max(1, half)
+
     return {
         "distinct1": len(unigrams) / max(1, len(ids)),
         "distinct2": len(bigrams) / max(1, len(ids) - 1),
+        "distinct3": len(trigrams) / max(1, len(ids) - 2),
         "max_repeat_run": max_run,
+        "repeat_bigram_ratio": repeat_bigram_ratio,
+        "repeat_trigram_ratio": repeat_trigram_ratio,
+        "tail_loop_ratio": tail_loop_ratio,
     }
 
 
@@ -67,12 +102,46 @@ def generate_with_top_p(
     temperature: float,
     top_p: float,
     top_k: int,
+    repetition_penalty: float,
+    no_repeat_ngram_size: int,
 ) -> torch.Tensor:
-    # 统一支持 top-p + top-k，便于直接扫 demo 参数。
+    # 统一支持 top-p + top-k，并额外支持 repetition penalty / no-repeat ngram。
+    # 这样可以直接探索“只改解码，不改训练”能否把 demo 再拉好一点。
     for _ in range(max_new_tokens):
         idx_cond = idx if idx.size(1) <= model.params.max_seq_len else idx[:, -model.params.max_seq_len :]
         logits = model(idx_cond)
         logits = logits[:, -1, :] / max(temperature, 1e-6)
+
+        # repetition penalty: 对已经生成过的 token 适度降温，
+        # 尤其适合小模型故事生成时抑制“短模板来回念”。
+        if repetition_penalty > 1.0:
+            for b in range(idx.size(0)):
+                seen_ids = torch.unique(idx[b])
+                seen_logits = logits[b, seen_ids]
+                penalized = torch.where(
+                    seen_logits < 0,
+                    seen_logits * repetition_penalty,
+                    seen_logits / repetition_penalty,
+                )
+                logits[b, seen_ids] = penalized
+
+        # no-repeat ngram: 直接阻断已经出现过的 n-gram 继续重复。
+        if no_repeat_ngram_size > 0 and idx.size(1) >= no_repeat_ngram_size - 1:
+            prefix_len = no_repeat_ngram_size - 1
+            for b in range(idx.size(0)):
+                tokens = idx[b].tolist()
+                banned = set()
+                if prefix_len == 0:
+                    banned.update(tokens)
+                else:
+                    prefix = tuple(tokens[-prefix_len:])
+                    for i in range(len(tokens) - no_repeat_ngram_size + 1):
+                        ngram = tokens[i : i + no_repeat_ngram_size]
+                        if tuple(ngram[:-1]) == prefix:
+                            banned.add(ngram[-1])
+                if banned:
+                    logits[b, list(banned)] = float("-inf")
+
         probs = F.softmax(logits, dim=-1)
 
         if top_k > 0:
@@ -109,6 +178,8 @@ def main():
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-new-tokens", type=int, default=120)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0, help=">1.0 时抑制重复 token。")
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=0, help=">0 时阻断重复 n-gram。")
     parser.add_argument(
         "--grid",
         default="1.0,0.9,40;0.8,0.9,40;0.9,0.9,20;1.0,0.85,20;0.8,0.95,40",
@@ -136,6 +207,8 @@ def main():
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                repetition_penalty=args.repetition_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
             )
             out_ids = y[0].tolist()
             merged_ids.extend(out_ids)
@@ -147,7 +220,11 @@ def main():
                     "text_prefix": text[:320],
                     "distinct1": stats["distinct1"],
                     "distinct2": stats["distinct2"],
+                    "distinct3": stats["distinct3"],
                     "max_repeat_run": stats["max_repeat_run"],
+                    "repeat_bigram_ratio": stats["repeat_bigram_ratio"],
+                    "repeat_trigram_ratio": stats["repeat_trigram_ratio"],
+                    "tail_loop_ratio": stats["tail_loop_ratio"],
                 }
             )
         merged_stats = distinct_stats(merged_ids)
@@ -156,9 +233,15 @@ def main():
                 "temperature": temperature,
                 "top_p": top_p,
                 "top_k": top_k,
+                "repetition_penalty": args.repetition_penalty,
+                "no_repeat_ngram_size": args.no_repeat_ngram_size,
                 "distinct1": merged_stats["distinct1"],
                 "distinct2": merged_stats["distinct2"],
+                "distinct3": merged_stats["distinct3"],
                 "max_repeat_run": merged_stats["max_repeat_run"],
+                "repeat_bigram_ratio": merged_stats["repeat_bigram_ratio"],
+                "repeat_trigram_ratio": merged_stats["repeat_trigram_ratio"],
+                "tail_loop_ratio": merged_stats["tail_loop_ratio"],
                 "samples": samples,
             }
         )

@@ -30,7 +30,9 @@ DEMO_PROMPTS = [
 ]
 
 SAMPLED_DEMO_CFG = {
-    "temperature": 1.0,
+    # 这是目前对 260K demo 更均衡的一组展示口径：
+    # 既能保留一定故事推进，又比 greedy / 过冷采样更不容易模板化。
+    "temperature": 0.95,
     "top_k": 40,
     "top_p": 0.9,
 }
@@ -357,9 +359,18 @@ def repetition_unlikelihood_loss(
 def distinct_stats(ids: List[int]) -> Dict[str, float]:
     toks = ids
     if not toks:
-        return {"distinct1": 0.0, "distinct2": 0.0, "max_repeat_run": 0.0}
+        return {
+            "distinct1": 0.0,
+            "distinct2": 0.0,
+            "distinct3": 0.0,
+            "max_repeat_run": 0.0,
+            "repeat_bigram_ratio": 0.0,
+            "repeat_trigram_ratio": 0.0,
+            "tail_loop_ratio": 0.0,
+        }
     unigrams = set(toks)
     bigrams = set(zip(toks, toks[1:])) if len(toks) > 1 else set()
+    trigrams = set(zip(toks, toks[1:], toks[2:])) if len(toks) > 2 else set()
     max_run = 1
     cur = 1
     for i in range(1, len(toks)):
@@ -368,10 +379,31 @@ def distinct_stats(ids: List[int]) -> Dict[str, float]:
             max_run = max(max_run, cur)
         else:
             cur = 1
+    bigram_total = max(0, len(toks) - 1)
+    trigram_total = max(0, len(toks) - 2)
+    repeat_bigram_ratio = 0.0
+    repeat_trigram_ratio = 0.0
+    if bigram_total > 0:
+        repeat_bigram_ratio = 1.0 - (len(bigrams) / bigram_total)
+    if trigram_total > 0:
+        repeat_trigram_ratio = 1.0 - (len(trigrams) / trigram_total)
+    tail_loop_ratio = 0.0
+    tail_span = min(24, len(toks))
+    if tail_span >= 8:
+        tail = toks[-tail_span:]
+        half = tail_span // 2
+        prefix = tail[:half]
+        suffix = tail[-half:]
+        matches = sum(1 for a, b in zip(prefix, suffix) if a == b)
+        tail_loop_ratio = matches / max(1, half)
     return {
         "distinct1": len(unigrams) / max(1, len(toks)),
         "distinct2": len(bigrams) / max(1, len(toks) - 1),
+        "distinct3": len(trigrams) / max(1, len(toks) - 2),
         "max_repeat_run": float(max_run),
+        "repeat_bigram_ratio": repeat_bigram_ratio,
+        "repeat_trigram_ratio": repeat_trigram_ratio,
+        "tail_loop_ratio": tail_loop_ratio,
     }
 
 
@@ -383,13 +415,17 @@ def generate_with_top_p(
     *,
     temperature: float,
     top_p: float,
+    top_k: int,
 ) -> torch.Tensor:
-    # 参考官方 README 的推荐，把 sampled demo 切到 top-p，更贴近真实演示口径。
+    # 采样演示统一走 top-p + top-k，避免训练日志和单独扫表脚本口径不一致。
     for _ in range(max_new_tokens):
         idx_cond = idx if idx.size(1) <= model.params.max_seq_len else idx[:, -model.params.max_seq_len :]
         logits = model(idx_cond)
         logits = logits[:, -1, :] / max(temperature, 1e-6)
         probs = F.softmax(logits, dim=-1)
+        if top_k > 0:
+            v, _ = torch.topk(probs, min(top_k, probs.size(-1)))
+            probs = probs.masked_fill(probs < v[:, [-1]], 0.0)
         sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
         cdf = torch.cumsum(sorted_probs, dim=-1)
         cutoff = cdf > top_p
@@ -546,7 +582,11 @@ def evaluate_with_teacher_prompts(
                     "text_prefix": text[:240],
                     "distinct1": stats["distinct1"],
                     "distinct2": stats["distinct2"],
+                    "distinct3": stats["distinct3"],
                     "max_repeat_run": stats["max_repeat_run"],
+                    "repeat_bigram_ratio": stats["repeat_bigram_ratio"],
+                    "repeat_trigram_ratio": stats["repeat_trigram_ratio"],
+                    "tail_loop_ratio": stats["tail_loop_ratio"],
                 }
             )
             # 260K 模型在官方项目里 sample 模式通常比 greedy 更像样，demo 也应显式记录这一点。
@@ -556,6 +596,7 @@ def evaluate_with_teacher_prompts(
                 max_new_tokens=80,
                 temperature=SAMPLED_DEMO_CFG["temperature"],
                 top_p=SAMPLED_DEMO_CFG["top_p"],
+                top_k=SAMPLED_DEMO_CFG["top_k"],
             )
             out_ids_sample = y_sample[0].tolist()
             text_sample = tokenizer.decode(out_ids_sample)
@@ -566,7 +607,11 @@ def evaluate_with_teacher_prompts(
                     "text_prefix": text_sample[:240],
                     "distinct1": stats_sample["distinct1"],
                     "distinct2": stats_sample["distinct2"],
+                    "distinct3": stats_sample["distinct3"],
                     "max_repeat_run": stats_sample["max_repeat_run"],
+                    "repeat_bigram_ratio": stats_sample["repeat_bigram_ratio"],
+                    "repeat_trigram_ratio": stats_sample["repeat_trigram_ratio"],
+                    "tail_loop_ratio": stats_sample["tail_loop_ratio"],
                 }
             )
     overall_stats = distinct_stats(all_ids)
@@ -578,7 +623,11 @@ def evaluate_with_teacher_prompts(
         "avg_token_match_ratio": result.get("aggregate", {}).get("avg_token_match_ratio"),
         "distinct1": overall_stats["distinct1"],
         "distinct2": overall_stats["distinct2"],
+        "distinct3": overall_stats["distinct3"],
         "max_repeat_run": overall_stats["max_repeat_run"],
+        "repeat_bigram_ratio": overall_stats["repeat_bigram_ratio"],
+        "repeat_trigram_ratio": overall_stats["repeat_trigram_ratio"],
+        "tail_loop_ratio": overall_stats["tail_loop_ratio"],
         "demo_samples": demos,
         "sampled_demo_cfg": SAMPLED_DEMO_CFG,
         "sampled_demo_samples": sampled_demos,
