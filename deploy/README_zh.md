@@ -1,17 +1,18 @@
 # 部署运行时说明
 
-本文档说明 `deploy/` 目录下新运行时骨架的用途、当前状态和基本用法。
+本文档说明 `deploy/` 目录下独立部署运行时的当前实现状态、使用方法和边界。这里描述的是“已经落地的实现口径”，不是规划口径。
 
 ## 目标
 
-当前新增运行时不是要替换 `runq.c` 的数学实现，而是先搭出一套：
+当前运行时的目标是提供一套独立于 `runq.c` 的部署/验证框架，满足以下几点：
 
-- 独立于 `runq.c` 的部署入口
-- 可切 CPU/HW 编译目标
-- 可从 `.h` 头文件资产加载模型
-- 可用于后续硬件验证的统一框架
+- 可从 `.h` 头文件资产直接加载模型和 tokenizer
+- 可生成 `CPU/HW` 两个部署产物
+- `CPU/HW` 两条部署路径共享同一条算子级 decode 主链路
+- 可通过 `runq_verify` 固定执行 `SW_REF -> HW_STUB -> compare`
+- 为后续真实硬件后端预留共享 RAM、双地址口径和 adapter 分层
 
-当前保留两条代码线：
+当前保留两条主线：
 
 1. `runq_deploy`
    - 面向实际部署
@@ -22,22 +23,94 @@
    - 面向硬件验证
    - 固定执行 `SW_REF -> HW_STUB -> compare`
 
+## 当前架构口径
+
+### 1. backend API 已经收敛为算子级接口
+
+部署主路径不再直接调用整图 `forward`。当前 `generate/chat` 都通过公共 decode 调度器，按算子级 backend API 推进单 token 推理。当前实际使用的算子接口包括：
+
+- `rmsnorm`
+- `linear_qkv`
+- `qk_matmul`
+- `softmax_row`
+- `av_matmul`
+- `linear_attn_o`
+- `linear_ffn_w1`
+- `linear_ffn_w3`
+- `gate_mul`
+- `linear_ffn_w2`
+- `residual_add`
+- `final_norm`
+- `lm_head`
+
+这意味着：
+
+- `runq_deploy_cpu`
+  - 通过 `SW_REF` backend 执行算子
+- `runq_deploy_hw`
+  - 当前仍通过 `HW_STUB` backend 执行算子
+  - 但调用边界已经与 CPU 版一致
+
+### 2. `runtime_hw_adapter` 当前是兼容层，不是真实硬件后端
+
+当前 `runtime_hw_adapter` 的职责是冻结这几件事：
+
+- 共享区边界
+- `cpu_ptr / cpu_uncached_addr / phys_addr` 三套口径
+- 线性作业 / 后处理作业的基础接口形状
+- `dma_load / dma_store / submit / wait_done / soft_reset` 这类后续真实硬件会用到的 API 入口
+
+当前实现状态是：
+
+- `HW_STUB` 仍然用软件数学实现算子结果
+- adapter 主要负责：
+  - 共享区 backing storage
+  - 地址布局输出
+  - host 环境下的 `memcpy` 型 DMA stub
+  - 作业提交接口的占位与 trace
+
+因此，当前 `runq_deploy_hw` 是“经过硬件后端边界和 adapter 兼容层”的版本，但还不是“真实 MMIO/DMA 硬件后端”。
+
+### 3. 共享 RAM / section 当前实现状态
+
+当前已经补齐：
+
+- `.model_assets`
+- `.runtime_arena`
+- `.accel_shared`
+- `.accel_trace`
+
+以及共享区子区域：
+
+- `ACCEL_IO_IN`
+- `ACCEL_IO_OUT`
+- `ACCEL_PARAM`
+- `ACCEL_KV_SHARED`
+- `ACCEL_SCRATCH`
+- `ACCEL_TRACE`
+
+需要注意：
+
+- host 构建默认不强制加载 linker section 片段
+- `deploy/ld/deploy_sections.ldh` 已经可以用于 SoC 侧链接接入
+- 但真实固定物理地址落版仍需要由上层 LoongArch/OpenLA500 主链接脚本显式 `include`
+
 ## 目录说明
 
 - `include/`
-  - 统一接口和公共类型
+  - 统一接口、类型和地址口径
 - `src/`
-  - 前端、后端、验证和主入口实现
+  - 前端、后端、adapter、验证和主入口实现
 - `assets/`
   - 部署使用的头文件资产
 - `tests/`
   - 后续固定 prompt / verify case 的位置
 - `ld/`
-  - 预留给后续 linker section 规划
+  - linker section 片段
 
 ## 当前资产状态
 
-当前正式资产可以直接由下面脚本导出：
+当前正式资产可由下面脚本导出：
 
 ```powershell
 python tools/export_deploy_headers.py --model-bin artifacts/stories260K/stories260K_q80.bin --tokenizer-bin artifacts/stories260K/tok512.bin
@@ -48,30 +121,42 @@ python tools/export_deploy_headers.py --model-bin artifacts/stories260K/stories2
 - `deploy/assets/stories260K_qat_best/stories_data.h`
 - `deploy/assets/stories260K_qat_best/tok512.h`
 
+当前导出的头文件已经带有：
+
+- `.model_assets` section 标注
+- `aligned(64)` 对齐约束
+
 ## 构建方法
 
 在仓库根目录执行：
 
 ```powershell
+make runq_deploy_cpu
+make runq_deploy_hw
+make runq_verify
+make export_deploy_assets
+```
+
+为了兼容旧脚本，下面这些旧目标名仍可继续使用：
+
+```powershell
 make runqdeploycpu
 make runqdeployhw
 make runqverify
+make exportdeployassets
 ```
 
-Windows/MSVC 下也已经补了：
+Windows/MSVC 下可使用：
 
 ```powershell
 build_msvc.bat
 ```
 
-当前已经主机侧验证通过：
+如果要在 SoC 侧接入 linker section 片段，可显式传入：
 
-- `runq_deploy_cpu.exe`
-- `runq_deploy_hw.exe`
-- `runq_verify.exe`
-- `artifacts/runq_deploy_cpu_regression_20260330_v2.json`
-- `artifacts/runq_deploy_cpu_fix_regression_20260330_v2.json`
-- `artifacts/runq_deploy_arena_regression_20260331.json`
+```powershell
+make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
+```
 
 ## 运行方法
 
@@ -87,7 +172,11 @@ build_msvc.bat
 .\runq_deploy_hw -n 140 -i "Once upon a time"
 ```
 
-当前 `HW` 版第一阶段仍走 `HW_STUB` 路径，目的是先把部署接口和共享内存边界固定下来。
+当前 `HW` 版会：
+
+- 经过 `HW_STUB` backend
+- 输出共享区 `ptr/cpu/phys/size` 布局
+- 在运行过程中输出 adapter trace
 
 ### 验证版
 
@@ -100,8 +189,9 @@ build_msvc.bat
 1. `SW_REF`
 2. `HW_STUB`
 3. 对比关键算子输出
+4. 输出逐项结果和最终 summary
 
-当前已经通过的对拍项有：
+当前 verify 已覆盖：
 
 - `rmsnorm`
 - `linear_qkv_q`
@@ -110,20 +200,11 @@ build_msvc.bat
 - `gate_mul`
 - `residual_add`
 
-另外，`runq_deploy_cpu` 已经完成一轮主机侧完整回归：
+其中 `qk_matmul` 已不再只是单元素检查，而是覆盖：
 
-- `build`：通过
-- `generate`：通过
-- `verify`：通过
-- `chat`：当前已恢复为接近 OpenLA500 的“安全多轮”语义，支持首轮 `system prompt`、首轮 CLI `user prompt` 和后续 `User:` 继续输入，但 `260K TinyStories` 模型对聊天模板响应仍然偏弱
-
-本轮还额外修复并验证通过：
-
-- 超长 prompt 会被安全拦截，不再写爆 token 缓冲区
-- `-s` seed 已真正生效，可复现同一输出
-- `runq_deploy_hw` 已经会经过 `runtime_hw_adapter` 输出共享缓冲与地址 trace
-- `RunState` 主工作区已切换为固定 `arena`
-- `xq.s / hq.s` 的 scale buffer 已改成按 group 数建模，而不是按元素数建模
+- `pos > 0`
+- 多元素输出行
+- 非零 `head_idx`
 
 ## 当前默认展示口径
 
@@ -139,24 +220,29 @@ build_msvc.bat
 
 当前阶段已经实现：
 
-- 默认资产加载
+- 默认头文件资产加载
 - `SW_REF` backend
 - `HW_STUB` backend
-- `generate/chat` 前端骨架
-- 算子级 verify 骨架
+- 算子级部署主路径
+- `generate/chat` 前端
+- arena 化 `RunState`
+- 共享区 descriptor / adapter 兼容层
+- 算子级 verify 与 summary 输出
 
-其中 `chat` 当前的具体边界为：
+其中 `chat` 当前边界为：
 
 - 行为上对齐 OpenLA500 的多轮演示风格
-- 安全性上增加了 token 容量检查与“剩余上下文不足”提示
-- 还不是完整 instruct/chat 产品形态，主要用于串口交互和运行时流程演示
+- 首轮支持 `system prompt` 与 CLI `user prompt`
+- 后续轮次继续读取 `User:`
+- 增加了 token 容量检查和剩余上下文检查
+- 主要用于运行时流程和串口交互演示，还不是完整 instruct/chat 产品形态
 
 当前阶段尚未完成：
 
 - 真实 `HW` backend
-- linker section 的正式落位
-- 当前最佳 QAT 权重到部署头文件资产的正式导出
-- 共享 RAM / uncached alias / phys 的正式 section 落位
+- 真实 MMIO/DMA 寄存器协议接入
+- SoC 主链接脚本对 `deploy_sections.ldh` 的正式接入
+- 当前最佳 QAT 权重的正式部署导出
 
 ## 说明
 

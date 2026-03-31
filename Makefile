@@ -11,6 +11,10 @@ DEPLOY_COMMON_SRCS = \
 	deploy/src/runtime_hw_adapter.c
 
 DEPLOY_CFLAGS = -O3 -Ideploy/include -std=gnu11
+# host 默认不强制接入 linker section 片段，避免破坏本地构建。
+# SoC 构建可通过以下变量注入：
+# make runq_deploy_cpu DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
+DEPLOY_LDFLAGS ?=
 
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
@@ -64,21 +68,34 @@ runembedded: runq_embedded.c
 .PHONY: runembeddedwin
 runembeddedwin: runembedded
 
+.PHONY: runq_deploy_cpu
+runq_deploy_cpu:
+	$(CC) $(DEPLOY_CFLAGS) -DRUNQ_DEPLOY_CPU -o runq_deploy_cpu deploy/src/runq_deploy.c $(DEPLOY_COMMON_SRCS) $(DEPLOY_LDFLAGS) -lm
+
+.PHONY: runq_deploy_hw
+runq_deploy_hw:
+	$(CC) $(DEPLOY_CFLAGS) -DRUNQ_DEPLOY_HW -o runq_deploy_hw deploy/src/runq_deploy.c $(DEPLOY_COMMON_SRCS) $(DEPLOY_LDFLAGS) -lm
+
+.PHONY: runq_verify
+runq_verify:
+	$(CC) $(DEPLOY_CFLAGS) -o runq_verify deploy/src/runq_verify.c deploy/src/runtime_verify.c $(DEPLOY_COMMON_SRCS) $(DEPLOY_LDFLAGS) -lm
+
+.PHONY: export_deploy_assets
+export_deploy_assets:
+	python tools/export_deploy_headers.py --model-bin artifacts/stories260K/stories260K_q80.bin --tokenizer-bin artifacts/stories260K/tok512.bin
+
+# 兼容旧目标名，避免已有脚本失效。
 .PHONY: runqdeploycpu
-runqdeploycpu:
-	$(CC) $(DEPLOY_CFLAGS) -DRUNQ_DEPLOY_CPU -o runq_deploy_cpu deploy/src/runq_deploy.c $(DEPLOY_COMMON_SRCS) -lm
+runqdeploycpu: runq_deploy_cpu
 
 .PHONY: runqdeployhw
-runqdeployhw:
-	$(CC) $(DEPLOY_CFLAGS) -DRUNQ_DEPLOY_HW -o runq_deploy_hw deploy/src/runq_deploy.c $(DEPLOY_COMMON_SRCS) -lm
+runqdeployhw: runq_deploy_hw
 
 .PHONY: runqverify
-runqverify:
-	$(CC) $(DEPLOY_CFLAGS) -o runq_verify deploy/src/runq_verify.c deploy/src/runtime_verify.c $(DEPLOY_COMMON_SRCS) -lm
+runqverify: runq_verify
 
 .PHONY: exportdeployassets
-exportdeployassets:
-	python tools/export_deploy_headers.py --model-bin artifacts/stories260K/stories260K_q80.bin --tokenizer-bin artifacts/stories260K/tok512.bin
+exportdeployassets: export_deploy_assets
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: rungnu

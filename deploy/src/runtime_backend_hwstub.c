@@ -173,13 +173,6 @@ static void hwstub_lm_head(RuntimeBackend *backend, float *logits, const float *
     matmul_ref(logits, &state->xq, backend->model->weights.wcls, backend->model->config.dim, backend->model->config.vocab_size, hwstub_group_size(backend));
 }
 
-static float *hwstub_forward_logits(RuntimeBackend *backend, int token, int pos) {
-    stub_trace(backend, "forward_logits");
-    runtime_hw_adapter_trace_op("forward_logits", pos, token);
-    // 先让 stub 结果和 SW_REF 严格一致，便于后续逐项替换成真实硬件作业。
-    return runtime_forward_logits_swref(backend->model, token, pos, hwstub_group_size(backend));
-}
-
 static const RuntimeBackendOps HWSTUB_OPS = {
     "hw_stub",
     hwstub_init,
@@ -198,7 +191,6 @@ static const RuntimeBackendOps HWSTUB_OPS = {
     hwstub_residual_add,
     hwstub_final_norm,
     hwstub_lm_head,
-    hwstub_forward_logits,
 };
 
 int runtime_backend_bind_hwstub(RuntimeBackend *backend, RuntimeModel *model) {

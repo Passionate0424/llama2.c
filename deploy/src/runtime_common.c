@@ -1,4 +1,5 @@
 #include "runtime_common.h"
+#include "runtime_backend.h"
 #include "runtime_memory_map.h"
 
 #include <ctype.h>
@@ -60,7 +61,6 @@ void runtime_model_init(RuntimeModel *model) {
 
 void runtime_model_destroy(RuntimeModel *model) {
     if (model->weights.q_tokens) free(model->weights.q_tokens);
-    if (model->weights.token_embedding_table) free(model->weights.token_embedding_table);
     if (model->weights.wq) free(model->weights.wq);
     if (model->weights.wk) free(model->weights.wk);
     if (model->weights.wv) free(model->weights.wv);
@@ -577,72 +577,77 @@ void apply_rope_inplace(float *q, float *k, int dim, int kv_dim, int head_size, 
     }
 }
 
-float *runtime_forward_logits_swref(RuntimeModel *model, int token, int pos, int group_size) {
+void runtime_load_embedding_row(const RuntimeModel *model, int token, float *out) {
+    const RuntimeConfig *config = &model->config;
+    const QuantizedTensor *q_tokens = model->weights.q_tokens;
+    int dim = config->dim;
+    int group_size = model->group_size;
+    int base = token * dim;
+
+    if (token < 0 || token >= config->vocab_size) {
+        fprintf(stderr, "runtime_load_embedding_row: token=%d 超出 vocab_size=%d\n", token, config->vocab_size);
+        exit(EXIT_FAILURE);
+    }
+
+    // token embedding 在资产里是一整张 q80 表。
+    // 这里按“单行”解码，既保留和原数学一致的结果，又避免整表展开到 heap。
+    for (int i = 0; i < dim; ++i) {
+        int flat_idx = base + i;
+        out[i] = (float)q_tokens[0].q[flat_idx] * q_tokens[0].s[flat_idx / group_size];
+    }
+}
+
+float *runtime_decode_transformer_step(RuntimeBackend *backend, int token, int pos) {
+    RuntimeModel *model = backend->model;
     RuntimeConfig *config = &model->config;
     RuntimeWeights *weights = &model->weights;
     RuntimeState *state = &model->state;
-    float *x = state->x;
     int dim = config->dim;
     int kv_dim = (config->dim * config->n_kv_heads) / config->n_heads;
-    int kv_mul = config->n_heads / config->n_kv_heads;
     int hidden_dim = config->hidden_dim;
     int head_size = dim / config->n_heads;
 
-    memcpy(x, weights->token_embedding_table + token * dim, (size_t)dim * sizeof(float));
+    // 这条路径是部署/验证共用的“单 token decode 调度器”。
+    // 关键点是：frontend 不再调用整图 forward，而是严格通过 backend 的算子级接口推进每一步。
+    runtime_load_embedding_row(model, token, state->x);
     for (int layer = 0; layer < config->n_layers; ++layer) {
-        rmsnorm_ref(state->xb, x, weights->rms_att_weight + layer * dim, dim);
-        quantize_tensor(&state->xq, state->xb, dim, group_size);
-        matmul_ref(state->q, &state->xq, weights->wq + layer, dim, dim, group_size);
-        matmul_ref(state->k, &state->xq, weights->wk + layer, dim, kv_dim, group_size);
-        matmul_ref(state->v, &state->xq, weights->wv + layer, dim, kv_dim, group_size);
-        apply_rope_inplace(state->q, state->k, dim, kv_dim, head_size, pos);
-
         int loff = layer * config->seq_len * kv_dim;
-        float *key_cache_row = state->key_cache + loff + pos * kv_dim;
-        float *value_cache_row = state->value_cache + loff + pos * kv_dim;
+        float *layer_key_cache = state->key_cache + loff;
+        float *layer_value_cache = state->value_cache + loff;
+        float *key_cache_row = layer_key_cache + pos * kv_dim;
+        float *value_cache_row = layer_value_cache + pos * kv_dim;
+
+        backend->ops->rmsnorm(backend, state->xb, state->x, weights->rms_att_weight + layer * dim, dim);
+        backend->ops->linear_qkv(backend, state->q, state->k, state->v, state->xb, layer);
+
+        // RoPE 和 KV cache 仍放在公共调度层：
+        // 1. backend 只关心算子语义；
+        // 2. 位置编码与 cache 组织属于跨算子的 runtime 责任。
+        apply_rope_inplace(state->q, state->k, dim, kv_dim, head_size, pos);
         memcpy(key_cache_row, state->k, (size_t)kv_dim * sizeof(float));
         memcpy(value_cache_row, state->v, (size_t)kv_dim * sizeof(float));
 
+        // xb 在 attention 子图里作为“所有 head 拼接后的上下文向量”。
+        memset(state->xb, 0, (size_t)dim * sizeof(float));
         for (int h = 0; h < config->n_heads; ++h) {
-            float *q_head = state->q + h * head_size;
             float *att_head = state->att + h * config->seq_len;
-            for (int t = 0; t <= pos; ++t) {
-                float *k_cached = state->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                float score = 0.0f;
-                for (int i_hs = 0; i_hs < head_size; ++i_hs) score += q_head[i_hs] * k_cached[i_hs];
-                score /= sqrtf((float)head_size);
-                att_head[t] = score;
-            }
-            softmax_ref(att_head, pos + 1);
             float *xb_head = state->xb + h * head_size;
-            memset(xb_head, 0, (size_t)head_size * sizeof(float));
-            for (int t = 0; t <= pos; ++t) {
-                float *v_cached = state->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                float a = att_head[t];
-                for (int i_hs = 0; i_hs < head_size; ++i_hs) xb_head[i_hs] += a * v_cached[i_hs];
-            }
+            backend->ops->qk_matmul(backend, att_head, state->q, layer_key_cache, pos, h);
+            backend->ops->softmax_row(backend, att_head, pos + 1);
+            backend->ops->av_matmul(backend, xb_head, att_head, layer_value_cache, pos, h);
         }
 
-        quantize_tensor(&state->xq, state->xb, dim, group_size);
-        matmul_ref(state->xb2, &state->xq, weights->wo + layer, dim, dim, group_size);
-        for (int i = 0; i < dim; ++i) x[i] += state->xb2[i];
+        backend->ops->linear_attn_o(backend, state->xb2, state->xb, layer);
+        backend->ops->residual_add(backend, state->x, state->xb2, dim);
 
-        rmsnorm_ref(state->xb, x, weights->rms_ffn_weight + layer * dim, dim);
-        quantize_tensor(&state->xq, state->xb, dim, group_size);
-        matmul_ref(state->hb, &state->xq, weights->w1 + layer, dim, hidden_dim, group_size);
-        matmul_ref(state->hb2, &state->xq, weights->w3 + layer, dim, hidden_dim, group_size);
-        for (int i = 0; i < hidden_dim; ++i) {
-            float val = state->hb[i];
-            val *= (1.0f / (1.0f + expf(-val)));
-            val *= state->hb2[i];
-            state->hb[i] = val;
-        }
-        quantize_tensor(&state->hq, state->hb, hidden_dim, group_size);
-        matmul_ref(state->xb, &state->hq, weights->w2 + layer, hidden_dim, dim, group_size);
-        for (int i = 0; i < dim; ++i) x[i] += state->xb[i];
+        backend->ops->rmsnorm(backend, state->xb, state->x, weights->rms_ffn_weight + layer * dim, dim);
+        backend->ops->linear_ffn_w1(backend, state->hb, state->xb, layer);
+        backend->ops->linear_ffn_w3(backend, state->hb2, state->xb, layer);
+        backend->ops->gate_mul(backend, state->hb, state->hb, state->hb2, hidden_dim);
+        backend->ops->linear_ffn_w2(backend, state->xb, state->hb, layer);
+        backend->ops->residual_add(backend, state->x, state->xb, dim);
     }
-    rmsnorm_ref(x, x, weights->rms_final_weight, dim);
-    quantize_tensor(&state->xq, x, dim, group_size);
-    matmul_ref(state->logits, &state->xq, weights->wcls, dim, config->vocab_size, group_size);
+    backend->ops->final_norm(backend, state->x, state->x);
+    backend->ops->lm_head(backend, state->logits, state->x);
     return state->logits;
 }

@@ -36,6 +36,29 @@
 #define RUNTIME_ACCEL_PARAM_UNC        0xbc2c0000u
 #define RUNTIME_ACCEL_PARAM_SIZE       0x00040000u
 
+// 共享 KV 子区：
+// 物理地址：0x1c300000 ~ 0x1c33ffff
+// CPU 别名：0xbc300000 ~ 0xbc33ffff
+#define RUNTIME_ACCEL_KV_SHARED_PHYS   0x1c300000u
+#define RUNTIME_ACCEL_KV_SHARED_UNC    0xbc300000u
+#define RUNTIME_ACCEL_KV_SHARED_SIZE   0x00040000u
+
+// 共享 scratch 子区：
+// 物理地址：0x1c340000 ~ 0x1c36ffff
+// CPU 别名：0xbc340000 ~ 0xbc36ffff
+#define RUNTIME_ACCEL_SCRATCH_PHYS     0x1c340000u
+#define RUNTIME_ACCEL_SCRATCH_UNC      0xbc340000u
+#define RUNTIME_ACCEL_SCRATCH_SIZE     0x00030000u
+
+// trace 子区：
+// 物理地址：0x1c370000 ~ 0x1c37ffff
+// CPU 别名：0xbc370000 ~ 0xbc37ffff
+#define RUNTIME_ACCEL_TRACE_PHYS       0x1c370000u
+#define RUNTIME_ACCEL_TRACE_UNC        0xbc370000u
+#define RUNTIME_ACCEL_TRACE_SIZE       0x00010000u
+
+#define RUNTIME_ACCEL_SHARED_SIZE      0x00100000u
+
 // 当前阶段围绕 260K 模型固定部署，因此运行时 arena 也先按 260K 规模冻结。
 #define RUNTIME_ARENA_SIZE             0x00100000u
 

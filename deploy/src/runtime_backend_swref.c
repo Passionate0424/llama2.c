@@ -156,11 +156,6 @@ static void swref_lm_head(RuntimeBackend *backend, float *logits, const float *x
     matmul_ref(logits, &state->xq, model->weights.wcls, model->config.dim, model->config.vocab_size, swref_group_size(backend));
 }
 
-static float *swref_forward_logits(RuntimeBackend *backend, int token, int pos) {
-    // 第一版部署 CPU 路径直接复用完整 runq-compatible 前向，先保证端到端可跑。
-    return runtime_forward_logits_swref(backend->model, token, pos, swref_group_size(backend));
-}
-
 static const RuntimeBackendOps SWREF_OPS = {
     "sw_ref",
     swref_init,
@@ -179,7 +174,6 @@ static const RuntimeBackendOps SWREF_OPS = {
     swref_residual_add,
     swref_final_norm,
     swref_lm_head,
-    swref_forward_logits,
 };
 
 int runtime_backend_bind_swref(RuntimeBackend *backend, RuntimeModel *model) {

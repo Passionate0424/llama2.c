@@ -173,7 +173,9 @@ int runtime_run_generate(RuntimeApp *app, char *prompt, int steps) {
     backend->ops->reset(backend);
     token = history_tokens[0];
     while (pos < steps) {
-        float *logits = backend->ops->forward_logits(backend, token, pos);
+        // 每个 token 的 logits 都由公共调度层按算子级 API 串出来，
+        // 这样 CPU/HW 两条部署路径看到的是同一套 backend 边界。
+        float *logits = runtime_decode_transformer_step(backend, token, pos);
         if (pos < num_prompt_tokens - 1) {
             next = history_tokens[pos + 1];
         } else {
@@ -274,7 +276,9 @@ int runtime_run_chat(RuntimeApp *app, char *cli_user_prompt, char *system_prompt
             break;
         }
 
-        float *logits = backend->ops->forward_logits(backend, token, pos);
+        // chat 模式和 generate 模式共享同一条 decode 调度链，
+        // 这样不会出现“某个模式偷偷绕过 backend API”的分叉路径。
+        float *logits = runtime_decode_transformer_step(backend, token, pos);
         if (user_idx < num_prompt_tokens) {
             // 仍在静默注入当前轮 prompt token，不进入采样。
             next = prompt_tokens[user_idx];

@@ -1,5 +1,4 @@
 import argparse
-import os
 from pathlib import Path
 
 
@@ -8,7 +7,17 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 
 def write_xxd_style_header(input_path: Path, output_path: Path, symbol_name: str) -> None:
     data = input_path.read_bytes()
-    lines = [f"unsigned char {symbol_name}[] = {{\n"]
+    lines = [
+        "/* 自动生成文件：由 tools/export_deploy_headers.py 导出。\n",
+        " * 约束：模型资产固定进入 .model_assets，并保持 64B 对齐，\n",
+        " * 以便 SoC 链接脚本可将其整体放入 MODEL_RO 区域。\n",
+        " */\n",
+        "#if defined(__GNUC__)\n",
+        f"__attribute__((section(\".model_assets\"), aligned(64))) unsigned char {symbol_name}[] = {{\n",
+        "#else\n",
+        f"unsigned char {symbol_name}[] = {{\n",
+        "#endif\n",
+    ]
     for start in range(0, len(data), 12):
         chunk = data[start : start + 12]
         lines.append("  " + ", ".join(f"0x{b:02x}" for b in chunk))

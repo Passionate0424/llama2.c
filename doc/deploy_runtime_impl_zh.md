@@ -1,230 +1,195 @@
 # 独立部署运行时实施记录
 
-本文档记录 `deploy/` 新运行时骨架的落地过程、当前状态和结论。
+本文档记录 `deploy/` 运行时在当前实现阶段已经完成的关键收敛点。这里重点描述“实现过程里已经做了什么”，用于帮助后续继续接硬件或回顾本轮改动。
 
-## 1. 背景
+## 1. 本轮实现结论
 
-当前任务不再以继续大规模训练为主，而是把已经得到的模型结果转成：
+本轮最大的变化不是再加一个新入口，而是把原先“骨架能跑”的运行时，继续收敛成更接近最终部署口径的结构：
 
-- 可部署的软件框架
-- 可验证硬件正确性的验证框架
+- 部署主路径已经切到算子级 backend API
+- `runq_deploy_cpu` 与 `runq_deploy_hw` 共享同一条单 token decode 调度链
+- `runtime_hw_adapter` 已补成明确的硬件兼容层
+- 共享 RAM 双地址口径已经体现在代码结构里
+- `runq_verify` 已补齐最终 summary，并加强了 `qk_matmul` 覆盖
 
-因此本轮新建独立运行时，而不继续沿用：
+当前仍然没有完成的，是“真实硬件寄存器协议/MMIO/DMA 后端”，这一层还只是兼容层骨架。
 
-- `runq.c`
-- `runq_embedded.c`
+## 2. 当前代码分层
 
-这种历史路径。
+### 2.1 frontend / common
 
-## 2. 本轮新增内容
+当前部署主链路由公共 decode 调度器负责推进，每个 token 的推理过程都会经过：
 
-本轮已经新增：
+- token embedding 按行解码
+- attention 子图算子
+- FFN 子图算子
+- final norm
+- lm head
 
-- `deploy/include/runtime_types.h`
-- `deploy/include/runtime_common.h`
-- `deploy/include/runtime_assets.h`
-- `deploy/include/runtime_backend.h`
-- `deploy/include/runtime_decode_cfg.h`
-- `deploy/include/runtime_frontend.h`
-- `deploy/include/runtime_verify.h`
-- `deploy/src/runtime_common.c`
-- `deploy/src/runtime_assets.c`
-- `deploy/src/runtime_backend_swref.c`
-- `deploy/src/runtime_backend_hwstub.c`
-- `deploy/src/runtime_frontend.c`
-- `deploy/src/runtime_verify.c`
-- `deploy/src/runtime_hw_adapter.c`
-- `deploy/src/runq_deploy.c`
-- `deploy/src/runq_verify.c`
-- `deploy/assets/stories260K_qat_best/stories_data.h`
-- `deploy/assets/stories260K_qat_best/tok512.h`
-- `deploy/README_zh.md`
-- `tools/export_deploy_headers.py`
+这里最重要的收敛是：
 
-同时更新：
+- frontend 不再直接调用整图 `forward_logits`
+- `generate/chat` 都走相同的算子级 backend 边界
 
-- `Makefile`
-- `build_msvc.bat`
+这样做的目的，是避免 CPU 路径和 HW 路径在主链路上分叉。
 
-## 3. 当前架构结论
+### 2.2 backend
 
-当前新运行时已经形成两条主线：
+当前 backend 的正式语义接口已经冻结在算子级：
 
-1. 部署线
-   - `runq_deploy_cpu`
-   - `runq_deploy_hw`
-2. 验证线
-   - `runq_verify`
+- `rmsnorm`
+- `linear_qkv`
+- `qk_matmul`
+- `softmax_row`
+- `av_matmul`
+- `linear_attn_o`
+- `linear_ffn_w1`
+- `linear_ffn_w3`
+- `gate_mul`
+- `linear_ffn_w2`
+- `residual_add`
+- `final_norm`
+- `lm_head`
 
-其中：
+当前状态：
 
-- `CPU` 版本负责先跑通部署逻辑
-- `HW` 版本负责保留后续硬件接入位置
-- `VERIFY` 负责对比 `SW_REF` 与 `HW_STUB`
+- `SW_REF`
+  - 作为部署/验证金标准
+- `HW_STUB`
+  - 作为“假硬件后端”
+  - 数学结果仍用软件算子实现
+  - 但调用边界与共享区 trace 已经过 adapter
 
-## 4. 当前结果
+### 2.3 hw adapter
 
-### 4.1 已完成
+`runtime_hw_adapter` 当前已经明确成“硬件兼容层”，职责不是算子数学，而是冻结硬件接入边界：
 
-- 已完成默认头文件资产解析
-- 已完成 `SW_REF` 后端最小实现
-- 已完成 `HW_STUB` 后端最小实现
-- 已完成 `generate/chat` 前端骨架
-- 已完成基本 verify 骨架
-- 已完成构建入口
-- 已完成 `xxd` 风格部署资产导出脚本
+- 共享区 descriptor
+- `cpu_ptr / cpu_uncached_addr / phys_addr / size`
+- linear/post 两类 job 描述结构
+- `dma_load / dma_store / submit / wait_done / soft_reset`
 
-本轮已经主机侧验证通过：
+当前 adapter 已经有：
 
-- `runq_deploy_cpu.exe` 可编译
-- `runq_deploy_hw.exe` 可编译
-- `runq_verify.exe` 可编译
-- `runq_verify` 已通过：
-  - `rmsnorm`
-  - `linear_qkv_q`
-  - `qk_matmul`
-  - `softmax_row`
-  - `gate_mul`
-  - `residual_add`
-- `export_deploy_headers.py` 已成功导出：
-  - `deploy/assets/stories260K_qat_best/stories_data.h`
-  - `deploy/assets/stories260K_qat_best/tok512.h`
-- 已完成 `runq_deploy_cpu` 一轮完整主机侧回归，结果文件：
-  - `artifacts/runq_deploy_cpu_regression_20260330_v2.json`
-- 已完成修复后的定向回归，结果文件：
-  - `artifacts/runq_deploy_cpu_fix_regression_20260330_v2.json`
-- 已完成 arena 化后的回归，结果文件：
-  - `artifacts/runq_deploy_arena_regression_20260331.json`
+- host 可运行的 backing storage
+- `ACCEL_IO_IN / OUT / PARAM / KV / SCRATCH / TRACE`
+- trace 输出
+- `memcpy` 型 DMA stub
 
-### 4.2 当前仍待继续
+这意味着后续接真实硬件时，优先替换的是 adapter 内部逻辑，而不是重新改 frontend/backend 边界。
+
+## 3. 本轮实现中的关键收敛
+
+### 3.1 去掉主路径对整图 forward 的依赖
+
+之前的 deploy 主路径仍然依赖一个整图 `forward_logits` 逃生口，这会让 backend API 只是“看起来像算子级”，实际运行却绕回 monolithic forward。
+
+本轮已收敛为：
+
+- 移除 backend 里的整图 `forward_logits`
+- 用公共 decode 调度器显式串起算子
+- `CPU/HW` 两个部署产物都经过这条路径
+
+这是当前实现最重要的一步，因为它直接决定了后续真硬件替换时，不需要再拆一次主链路。
+
+### 3.2 token embedding 改成按 token 行解码
+
+之前运行时会把整张 embedding 表展开成 float 缓冲，这会额外占一份 heap。
+
+本轮改成：
+
+- 保留 q80 资产原位映射
+- 推理时只按当前 token 解码一行 embedding
+
+效果：
+
+- 少了一份整表 float 拷贝
+- 更贴近 SoC 上“静态资产 + 小工作区”的部署形态
+
+### 3.3 共享 RAM 与 section 口径写进实现
+
+本轮把共享 RAM 的冻结子区真正写进了实现：
+
+- `IO_IN`
+- `IO_OUT`
+- `PARAM`
+- `KV_SHARED`
+- `SCRATCH`
+- `TRACE`
+
+并且把资产头、arena、共享区 section 都补上了代码/脚本支撑：
+
+- `.model_assets`
+- `.runtime_arena`
+- `.accel_shared`
+- `.accel_trace`
+
+目前 host 默认仍不强制启用 linker 片段，这是为了保持本地构建可用；SoC 侧需要由主链接脚本继续接入。
+
+### 3.4 verify 从“骨架”提升成可直接回归的工具
+
+本轮 `runq_verify` 已经不只是逐项打印，而是：
+
+- 仍固定执行 `SW_REF -> HW_STUB -> compare`
+- 增强了 `qk_matmul` 的场景覆盖
+- 结尾输出统一 summary
+
+当前 verify 已通过的项目：
+
+- `rmsnorm`
+- `linear_qkv_q`
+- `qk_matmul`
+- `softmax_row`
+- `gate_mul`
+- `residual_add`
+
+其中 `qk_matmul` 已覆盖：
+
+- `pos > 0`
+- 多元素行长
+- 非零 `head_idx`
+
+## 4. 当前已验证结果
+
+本轮主机侧已经确认：
+
+- `make runq_verify`
+  - 通过
+- `./runq_verify.exe`
+  - 通过
+  - 最终输出 `summary total=6 failed=0 status=PASS`
+- `make runq_deploy_hw`
+  - 通过
+- `./runq_deploy_hw.exe -n 2 -i "Once upon a time"`
+  - 通过
+  - 会输出全部共享区的 `ptr/cpu/phys/size`
+  - 会输出算子级 adapter trace
+- CPU 部署路径也已通过临时产物验证：
+  - `generate` 可正常输出文本
+
+## 5. 目前仍未完成的部分
+
+虽然这轮已经把接口和结构收敛了很多，但下面这些仍然没完成：
 
 - 真实 `HW` backend
-- 共享 RAM 的正式静态区/arena 落位
-- linker section 规划文件
-- 当前最佳 QAT 模型资产正式导出
-- 对 `runq_deploy_cpu/hw` 做更完整的行为回归
+- 真实 MMIO 寄存器协议
+- 真实 DMA 提交/完成等待
+- SoC 主链接脚本对 `deploy_sections.ldh` 的正式接入
+- 当前最佳 QAT checkpoint 的正式部署导出
 
-## 5. 当前采用的工程策略
+换句话说，当前 `runq_deploy_hw` 是：
 
-### 5.1 资产策略
+- 真实部署主链路
+- 真实共享区/地址口径
+- 真实 adapter 分层
+- 但算子执行仍然是 `HW_STUB`
 
-当前已经不再只是“兼容引入”：
+## 6. 对后续实现最重要的提醒
 
-- `export_deploy_headers.py` 已能直接生成 OpenLA500 风格的 `xxd -i` 资产头文件
-- 第一版导出链已经打通到：
-  - `stories260K_q80.bin`
-  - `tok512.bin`
+后续如果要继续接真实硬件，建议优先保持下面三点不再回退：
 
-需要说明的是：
+1. 不要把 frontend 再改回整图 `forward`
+2. 不要让 HW 路径绕过 `runtime_hw_adapter`
+3. 不要丢掉 `cpu_ptr / uncached / phys` 三套地址口径
 
-- 当前 `deploy/assets/stories260K_qat_best/` 里的资产已经是正式 `xxd` 风格头文件
-- 但它们当前仍然对应 `q80` 兼容模型资产
-- 还不是“当前最佳 QAT checkpoint 的正式部署导出结果”
-
-### 5.2 内存策略
-
-当前代码阶段先允许一部分初始化时动态分配，以便更快把框架跑起来。
-
-但目标不变：
-
-- 后续收敛为“静态资产 + arena + 共享 RAM”
-- 避免运行时持续零散 `malloc/calloc`
-
-本轮进一步推进后：
-
-- `RunState` 主工作区已经切换为固定 `arena`
-- 部署主路径不再依赖一组零散 `calloc/free`
-- 这一步更贴近后续 SoC 上“静态资产 + arena + 共享 RAM”的实际部署形态
-
-### 5.3 验证策略
-
-当前验证不是对 `runq.c` 做完全行为兼容，而是：
-
-- 用新 `SW_REF` 作为金标准
-- `HW_STUB` 先保证调用链与接口一致
-- 后续再逐步替换成真实硬件实现
-
-### 5.4 当前回归结论
-
-`runq_deploy_cpu` 当前主机侧回归结论如下：
-
-- `build`
-  - 通过
-- `generate`
-  - 对固定 8 个 prompt 均可正常运行并输出文本
-- `verify`
-  - 通过
-- `chat`
-  - 已恢复为与 OpenLA500 `runq` 更接近的“安全多轮”语义
-  - 首轮支持 `system prompt` + `CLI user prompt`
-  - 后续轮次继续从串口/标准输入读取 `User:`
-  - 当前主循环的 token feed 顺序仍保持正确：先确定当前输入 token，再执行 `forward`
-  - 新增“剩余上下文不足”检测，避免多轮对话把上下文窗口静默写爆
-  - 但当前 `260K TinyStories` 模型对 `[INST] ... [/INST]` 这类聊天模板响应较弱
-  - 因此当前更适合作为：
-    - 运行时流程验证
-    - 串口交互路径验证
-  - 暂不适合作为质量展示主模式
-
-### 5.5 本轮已修复问题
-
-本轮针对运行时骨架中已经暴露出的高优先级问题，完成了以下修复：
-
-1. `history_tokens` 缓冲区越界风险
-- `encode_text()` 已增加容量参数
-- `generate/chat` 编码阶段现在会检查 token 缓冲区容量
-- 超长 prompt 会明确报错，不再静默写爆
-
-2. `chat` 主循环 token feed 顺序错误
-- 已改成安全多轮实现
-- 现在和 `generate` 一样：
-  - 先确定当前输入 token
-  - 再执行 `forward`
-  - prompt token 只用于静默注入，不再错序进入 `next` 逻辑
-  - assistant 结束 token 不再继续送入模型，而是直接切回下一轮 `User:`
-
-3. `group_size` 假设过强
-- 激活量化路径不再要求 `n % group_size == 0`
-- 现在支持最后一个不满的 group
-- 这与当前 `260K` 模型 `hidden_dim=172` 的情况对齐
-
-4. 资产解析校验不足
-- 已增加模型 header 大小与权重布局大小检查
-- 已增加权重 tensor 和 `group_size` 的整除关系检查
-- 已增加 tokenizer 基本边界检查
-
-5. `-s` 参数文档/实现不一致
-- 现在 `-s` 已真正接入
-- 可用于固定随机种子，方便可复现实验
-
-6. `HW_STUB` 不经过 adapter
-- `runtime_backend_hwstub.c` 已显式调用 `runtime_hw_adapter`
-- 现在 `runq_deploy_hw` / `runq_verify` 会输出共享缓冲和地址口径 trace
-
-7. `RunState` 仍然依赖大量零散 heap
-- 当前已改成固定 `arena`
-- 运行时主工作区不再由多次 `calloc/free` 维护
-- 这降低了后续接硬件前的内存布局漂移风险
-
-8. `xq.s / hq.s` 的 scale buffer 建模不准确
-- 现在已经统一改成按 `grouped_scale_count()` 计算
-- 不再错误地按“每元素一个 scale”分配 arena 空间
-- 这使得运行时内存布局和 q80/group quant 数学保持一致
-
-修复后的定向回归结果表明：
-
-- 长 prompt 保护：通过
-- seed 可复现：通过
-- verify：通过
-- `runq_deploy_hw` 走 adapter trace：通过
-
-## 6. 下一步
-
-下一步建议继续按这个顺序推进：
-
-1. 补 `ld/` 下 section 规划
-2. 明确共享 RAM / uncached alias 地址组织
-3. 把共享 RAM / uncached alias 真正落进代码与 section 规划
-4. 让 `runq_verify` 输出更明确的误差摘要与更多算子覆盖
-5. 收敛 `runq_deploy_cpu` 的默认展示行为
-6. 再开始接真正的 `HW` backend
+这三点已经是当前实现里最值钱的“结构性收敛”。

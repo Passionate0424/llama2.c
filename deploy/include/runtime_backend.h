@@ -21,7 +21,6 @@ typedef struct RuntimeBackendOps {
     void (*residual_add)(RuntimeBackend *backend, float *dst, const float *src, int size);
     void (*final_norm)(RuntimeBackend *backend, float *out, const float *x);
     void (*lm_head)(RuntimeBackend *backend, float *logits, const float *x);
-    float *(*forward_logits)(RuntimeBackend *backend, int token, int pos);
 } RuntimeBackendOps;
 
 struct RuntimeBackend {

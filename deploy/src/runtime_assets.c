@@ -158,13 +158,9 @@ int runtime_load_default_model(RuntimeModel *model) {
         weights->rms_final_weight = fptr; fptr += cfg->dim;
 
         weights_ptr = (void *)fptr;
+        // token embedding 保持为 q80 资产原位映射。
+        // 运行时改成“按 token 行解码”，避免再把整张 embedding 表复制一份到 heap。
         weights->q_tokens = init_quantized_tensors(&weights_ptr, 1, cfg->vocab_size * cfg->dim, group_size);
-        weights->token_embedding_table = (float *)malloc((size_t)cfg->vocab_size * (size_t)cfg->dim * sizeof(float));
-        if (!weights->token_embedding_table) {
-            fprintf(stderr, "runtime_load_default_model: token_embedding_table 分配失败\n");
-            return -1;
-        }
-        dequantize_tensor(weights->q_tokens, weights->token_embedding_table, cfg->vocab_size * cfg->dim, group_size);
         weights->wq = init_quantized_tensors(&weights_ptr, cfg->n_layers, cfg->dim * (cfg->n_heads * head_size), group_size);
         weights->wk = init_quantized_tensors(&weights_ptr, cfg->n_layers, cfg->dim * (cfg->n_kv_heads * head_size), group_size);
         weights->wv = init_quantized_tensors(&weights_ptr, cfg->n_layers, cfg->dim * (cfg->n_kv_heads * head_size), group_size);

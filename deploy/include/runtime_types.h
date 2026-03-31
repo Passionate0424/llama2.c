@@ -24,7 +24,6 @@ typedef struct {
 
 typedef struct {
     QuantizedTensor *q_tokens;
-    float *token_embedding_table;
     float *rms_att_weight;
     float *rms_ffn_weight;
     QuantizedTensor *wq;
@@ -72,7 +71,13 @@ typedef struct {
 
 // 共享缓冲必须显式区分 CPU 访问地址和给 DMA/MMIO 编程用的物理地址。
 typedef struct {
+    // CPU 实际可解引用的指针。
+    // 在 host / HW_STUB 环境下通常指向本地静态数组；
+    // 在 SoC 环境下可替换成 uncached alias 对应的虚拟地址映射。
+    void *cpu_ptr;
+    // CPU 使用的 uncached alias 地址口径（用于日志、寄存器编程参数准备）。
     uintptr_t cpu_uncached_addr;
+    // DMA / MMIO 编程使用的物理总线地址口径。
     uint32_t phys_addr;
     size_t size;
 } SharedBufferDesc;

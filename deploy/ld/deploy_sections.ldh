@@ -1,19 +1,50 @@
-/* 
+/*
  * deploy_sections.ldh
  *
- * 第一版先作为 linker 规划占位文件存在。
- * 后续在对接 LoongArch / OpenLA500 链接脚本时，把：
- * - .model_assets
- * - .runtime_arena
- * - .accel_shared
- * - .accel_trace
- * 这些 section 的真实落位补进来。
+ * 这个片段用于 SoC 链接脚本 include：
+ * - host 构建不强制使用，避免影响本地 gcc/msvc 可执行流程；
+ * - SoC 链接时可把这些输出段映射到固定物理地址区间。
+ *
+ * 说明：
+ * 1) 这里不直接硬编码 ORIGIN/LENGTH，交给上层主链接脚本决定；
+ * 2) 通过 PROVIDE 暴露边界符号，便于运行时做区间核对；
+ * 3) KEEP 确保未直接引用的数据段也不会被链接器回收。
  */
 
-SECTIONS
-{
-    .model_assets : { *(.model_assets*) }
-    .runtime_arena : { *(.runtime_arena*) }
-    .accel_shared : { *(.accel_shared*) }
-    .accel_trace : { *(.accel_trace*) }
+SECTIONS {
+    . = ALIGN(64);
+    PROVIDE(__model_assets_start = .);
+    .model_assets : {
+        KEEP(*(.model_assets))
+        KEEP(*(.model_assets*))
+    }
+    . = ALIGN(64);
+    PROVIDE(__model_assets_end = .);
+
+    . = ALIGN(64);
+    PROVIDE(__runtime_arena_start = .);
+    .runtime_arena : {
+        KEEP(*(.runtime_arena))
+        KEEP(*(.runtime_arena*))
+    }
+    . = ALIGN(64);
+    PROVIDE(__runtime_arena_end = .);
+
+    . = ALIGN(64);
+    PROVIDE(__accel_shared_start = .);
+    .accel_shared : {
+        KEEP(*(.accel_shared))
+        KEEP(*(.accel_shared*))
+    }
+    . = ALIGN(64);
+    PROVIDE(__accel_shared_end = .);
+
+    . = ALIGN(64);
+    PROVIDE(__accel_trace_start = .);
+    .accel_trace : {
+        KEEP(*(.accel_trace))
+        KEEP(*(.accel_trace*))
+    }
+    . = ALIGN(64);
+    PROVIDE(__accel_trace_end = .);
 }

@@ -54,6 +54,7 @@ void read_stdin_line(const char *guide, char *buffer, size_t bufsize);
 
 void apply_rope_inplace(float *q, float *k, int dim, int kv_dim, int head_size, int pos);
 
-float *runtime_forward_logits_swref(RuntimeModel *model, int token, int pos, int group_size);
+void runtime_load_embedding_row(const RuntimeModel *model, int token, float *out);
+float *runtime_decode_transformer_step(RuntimeBackend *backend, int token, int pos);
 
 #endif
