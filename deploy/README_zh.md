@@ -56,6 +56,7 @@
 当前 `runtime_hw_adapter` 的职责是冻结这几件事：
 
 - 共享区边界
+- command window 边界
 - `cpu_ptr / cpu_uncached_addr / phys_addr` 三套口径
 - 线性作业 / 后处理作业的基础接口形状
 - `dma_load / dma_store / submit / wait_done / soft_reset` 这类后续真实硬件会用到的 API 入口
@@ -65,11 +66,25 @@
 - `HW_STUB` 仍然用软件数学实现算子结果
 - adapter 主要负责：
   - 共享区 backing storage
+  - command/completion window backing storage
   - 地址布局输出
   - host 环境下的 `memcpy` 型 DMA stub
   - 作业提交接口的占位与 trace
 
 因此，当前 `runq_deploy_hw` 是“经过硬件后端边界和 adapter 兼容层”的版本，但还不是“真实 MMIO/DMA 硬件后端”。
+
+当前还额外冻结了一个独立 command window，用于后续 RTL queue 模式联调：
+
+- `CMDQ`
+- `CMPQ`
+- `DBG2`
+
+需要强调的是：
+
+- 现有 `ACCEL_SHARED` 1MB 不因为 queue 需求而改动
+- command/completion 走独立窗口
+- 默认提交路径仍然保留 legacy 口径
+- queue mode 只是后续可切入的 adapter 内部模式，不会自动替换当前默认路径
 
 ### 3. 共享 RAM / section 当前实现状态
 
@@ -79,6 +94,9 @@
 - `.runtime_arena`
 - `.accel_shared`
 - `.accel_trace`
+- `.accel_cmdq`
+- `.accel_cmpq`
+- `.accel_dbg2`
 
 以及共享区子区域：
 
@@ -88,6 +106,59 @@
 - `ACCEL_KV_SHARED`
 - `ACCEL_SCRATCH`
 - `ACCEL_TRACE`
+
+此外还新增了独立的 command window 子区域：
+
+- `ACCEL_CMDQ`
+- `ACCEL_CMPQ`
+- `ACCEL_DBG2`
+
+当前实现中的 command window 地址划分如下：
+
+- `CMD_WINDOW`
+  - 物理：`0x1c400000 ~ 0x1c40ffff`
+  - CPU uncached alias：`0xbc400000 ~ 0xbc40ffff`
+- `CMDQ`
+  - 物理：`0x1c400000 ~ 0x1c403fff`
+  - CPU uncached alias：`0xbc400000 ~ 0xbc403fff`
+  - 大小：`16KB`
+- `CMPQ`
+  - 物理：`0x1c404000 ~ 0x1c404fff`
+  - CPU uncached alias：`0xbc404000 ~ 0xbc404fff`
+  - 大小：`4KB`
+- `DBG2`
+  - 物理：`0x1c405000 ~ 0x1c405fff`
+  - CPU uncached alias：`0xbc405000 ~ 0xbc405fff`
+  - 大小：`4KB`
+
+当前还额外冻结了最小 queue entry 合同：
+
+- `CMDQ entry`
+  - 大小：`32B`
+  - 当前软件/RTL 对齐字段：
+    - `opcode`
+    - `job_id`
+    - `addr`
+    - `len_bytes`
+    - `qos_class`
+    - `stride_en`
+    - `line_size`
+    - `line_stride`
+- `CMPQ entry`
+  - 大小：`16B`
+  - 当前最小字段：
+    - `job_id`
+    - `status`
+    - `error_code`
+    - `cycles`
+    - `info0`
+
+按当前窗口大小推导出的 ring 容量为：
+
+- `CMDQ depth = 512`
+- `CMPQ depth = 256`
+
+这些合同当前只用于冻结软件/硬件交界面，默认提交路径仍不会自动切到 queue mode。
 
 需要注意：
 
@@ -176,6 +247,7 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 
 - 经过 `HW_STUB` backend
 - 输出共享区 `ptr/cpu/phys/size` 布局
+- 输出 command window `ptr/cpu/phys/size` 布局
 - 在运行过程中输出 adapter trace
 
 ### 验证版
@@ -227,6 +299,8 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 - `generate/chat` 前端
 - arena 化 `RunState`
 - 共享区 descriptor / adapter 兼容层
+- command/completion 独立窗口的地址、backing storage 与 getter
+- 最小 `CMDQ/CMPQ` entry 结构体与容量推导
 - 算子级 verify 与 summary 输出
 
 其中 `chat` 当前边界为：
@@ -241,6 +315,7 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 
 - 真实 `HW` backend
 - 真实 MMIO/DMA 寄存器协议接入
+- queue mode 的真实 descriptor / enqueue / completion 协议
 - SoC 主链接脚本对 `deploy_sections.ldh` 的正式接入
 - 当前最佳 QAT 权重的正式部署导出
 

@@ -47,4 +47,31 @@ SECTIONS {
     }
     . = ALIGN(64);
     PROVIDE(__accel_trace_end = .);
+
+    . = ALIGN(64);
+    PROVIDE(__accel_cmdq_start = .);
+    .accel_cmdq : {
+        KEEP(*(.accel_cmdq))
+        KEEP(*(.accel_cmdq*))
+    }
+    . = ALIGN(64);
+    PROVIDE(__accel_cmdq_end = .);
+
+    . = ALIGN(64);
+    PROVIDE(__accel_cmpq_start = .);
+    .accel_cmpq : {
+        KEEP(*(.accel_cmpq))
+        KEEP(*(.accel_cmpq*))
+    }
+    . = ALIGN(64);
+    PROVIDE(__accel_cmpq_end = .);
+
+    . = ALIGN(64);
+    PROVIDE(__accel_dbg2_start = .);
+    .accel_dbg2 : {
+        KEEP(*(.accel_dbg2))
+        KEEP(*(.accel_dbg2*))
+    }
+    . = ALIGN(64);
+    PROVIDE(__accel_dbg2_end = .);
 }

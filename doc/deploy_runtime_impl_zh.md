@@ -65,6 +65,7 @@
 `runtime_hw_adapter` 当前已经明确成“硬件兼容层”，职责不是算子数学，而是冻结硬件接入边界：
 
 - 共享区 descriptor
+- command/completion window descriptor
 - `cpu_ptr / cpu_uncached_addr / phys_addr / size`
 - linear/post 两类 job 描述结构
 - `dma_load / dma_store / submit / wait_done / soft_reset`
@@ -73,8 +74,10 @@
 
 - host 可运行的 backing storage
 - `ACCEL_IO_IN / OUT / PARAM / KV / SCRATCH / TRACE`
+- `ACCEL_CMDQ / CMPQ / DBG2`
 - trace 输出
 - `memcpy` 型 DMA stub
+- 最小 queue entry builder / 容量推导接口
 
 这意味着后续接真实硬件时，优先替换的是 adapter 内部逻辑，而不是重新改 frontend/backend 边界。
 
@@ -117,14 +120,74 @@
 - `SCRATCH`
 - `TRACE`
 
+同时新增了与数据面分离的 command window：
+
+- `CMDQ`
+- `CMPQ`
+- `DBG2`
+
 并且把资产头、arena、共享区 section 都补上了代码/脚本支撑：
 
 - `.model_assets`
 - `.runtime_arena`
 - `.accel_shared`
 - `.accel_trace`
+- `.accel_cmdq`
+- `.accel_cmpq`
+- `.accel_dbg2`
 
 目前 host 默认仍不强制启用 linker 片段，这是为了保持本地构建可用；SoC 侧需要由主链接脚本继续接入。
+
+这里采用的是“数据面/控制面分离”的口径：
+
+- 原有 `ACCEL_SHARED` 1MB 完全保持不动
+- `CMDQ/CMPQ/DBG2` 从 8MB AXI SRAM 的后半段另开独立窗口
+- 默认软件路径仍保持 legacy 提交方式，不因为预留了 queue 地址就立刻切到 queue mode
+
+当前 command window 地址划分为：
+
+- `CMD_WINDOW`
+  - `0x1c400000 ~ 0x1c40ffff`
+- `CMDQ`
+  - `0x1c400000 ~ 0x1c403fff`
+- `CMPQ`
+  - `0x1c404000 ~ 0x1c404fff`
+- `DBG2`
+  - `0x1c405000 ~ 0x1c405fff`
+
+对应 CPU uncached alias：
+
+- `0xbc400000 ~ 0xbc40ffff`
+
+在此基础上，本轮还冻结了最小 queue entry 合同：
+
+- `RuntimeHwCmdEntry`
+  - `32B`
+  - 字段直接贴合当前 RTL `dma_rdwr` 已有输入：
+    - `opcode`
+    - `addr`
+    - `len_bytes`
+    - `qos_class`
+    - `stride_en`
+    - `line_size`
+    - `line_stride`
+    - `job_id`
+- `RuntimeHwCmpEntry`
+  - `16B`
+  - 当前最小回报字段：
+    - `job_id`
+    - `status`
+    - `error_code`
+    - `cycles`
+    - `info0`
+
+并且在 adapter 中加了：
+
+- entry 大小静态断言
+- `CMDQ/CMPQ` 深度推导
+- 轻量 builder / layout check
+
+这样后续即使真实 queue mode 还没接通，软件和 RTL 也已经有一套明确的 entry 合同可以围绕着继续长。
 
 ### 3.4 verify 从“骨架”提升成可直接回归的工具
 
@@ -163,6 +226,8 @@
 - `./runq_deploy_hw.exe -n 2 -i "Once upon a time"`
   - 通过
   - 会输出全部共享区的 `ptr/cpu/phys/size`
+  - 会输出 `CMDQ/CMPQ/DBG2` 的 `ptr/cpu/phys/size`
+  - 会输出 `CMDQ entry_size=32B / depth=512` 与 `CMPQ entry_size=16B / depth=256`
   - 会输出算子级 adapter trace
 - CPU 部署路径也已通过临时产物验证：
   - `generate` 可正常输出文本
@@ -174,6 +239,7 @@
 - 真实 `HW` backend
 - 真实 MMIO 寄存器协议
 - 真实 DMA 提交/完成等待
+- queue mode 的真实 descriptor / enqueue / completion 语义
 - SoC 主链接脚本对 `deploy_sections.ldh` 的正式接入
 - 当前最佳 QAT checkpoint 的正式部署导出
 

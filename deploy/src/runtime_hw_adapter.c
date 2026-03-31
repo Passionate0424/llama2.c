@@ -14,6 +14,17 @@
 #define RUNTIME_SEC(section_name)
 #endif
 
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#define RUNTIME_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#else
+#define RUNTIME_STATIC_ASSERT(cond, msg)
+#endif
+
+RUNTIME_STATIC_ASSERT(sizeof(RuntimeHwCmdEntry) == RUNTIME_HW_CMD_ENTRY_SIZE, "RuntimeHwCmdEntry must stay 32B");
+RUNTIME_STATIC_ASSERT(sizeof(RuntimeHwCmpEntry) == RUNTIME_HW_CMP_ENTRY_SIZE, "RuntimeHwCmpEntry must stay 16B");
+RUNTIME_STATIC_ASSERT((RUNTIME_ACCEL_CMDQ_SIZE % RUNTIME_HW_CMD_ENTRY_SIZE) == 0, "CMDQ size must align to cmd entry size");
+RUNTIME_STATIC_ASSERT((RUNTIME_ACCEL_CMPQ_SIZE % RUNTIME_HW_CMP_ENTRY_SIZE) == 0, "CMPQ size must align to cmp entry size");
+
 // 共享区 backing storage：
 // - 在 host/HW_STUB 上直接作为可访问内存；
 // - 在 SoC 上可替换成实际 uncached alias 映射，接口层不变。
@@ -24,6 +35,14 @@ static unsigned char g_accel_kv[RUNTIME_ACCEL_KV_SHARED_SIZE] RUNTIME_SEC(".acce
 static unsigned char g_accel_scratch[RUNTIME_ACCEL_SCRATCH_SIZE] RUNTIME_SEC(".accel_shared");
 static unsigned char g_accel_trace[RUNTIME_ACCEL_TRACE_SIZE] RUNTIME_SEC(".accel_trace");
 
+// command window backing storage：
+// - 这块故意不复用现有 1MB shared window；
+// - 目的是把 queue/control plane 和 data plane 解耦；
+// - 当前先作为 host/HW_STUB 下的静态 backing storage，后续 SoC 上可映射到独立 SRAM 窗口。
+static unsigned char g_accel_cmdq[RUNTIME_ACCEL_CMDQ_SIZE] RUNTIME_SEC(".accel_cmdq");
+static unsigned char g_accel_cmpq[RUNTIME_ACCEL_CMPQ_SIZE] RUNTIME_SEC(".accel_cmpq");
+static unsigned char g_accel_dbg2[RUNTIME_ACCEL_DBG2_SIZE] RUNTIME_SEC(".accel_dbg2");
+
 typedef struct {
     uint32_t mmio_base_phys;
     uintptr_t mmio_base_uncached;
@@ -33,6 +52,9 @@ typedef struct {
     SharedBufferDesc shared_kv;
     SharedBufferDesc shared_scratch;
     SharedBufferDesc shared_trace;
+    SharedBufferDesc shared_cmdq;
+    SharedBufferDesc shared_cmpq;
+    SharedBufferDesc shared_dbg2;
 } RuntimeHwAdapter;
 
 static RuntimeHwAdapter g_hw_adapter = {
@@ -44,6 +66,9 @@ static RuntimeHwAdapter g_hw_adapter = {
     {g_accel_kv, RUNTIME_ACCEL_KV_SHARED_UNC, RUNTIME_ACCEL_KV_SHARED_PHYS, RUNTIME_ACCEL_KV_SHARED_SIZE},
     {g_accel_scratch, RUNTIME_ACCEL_SCRATCH_UNC, RUNTIME_ACCEL_SCRATCH_PHYS, RUNTIME_ACCEL_SCRATCH_SIZE},
     {g_accel_trace, RUNTIME_ACCEL_TRACE_UNC, RUNTIME_ACCEL_TRACE_PHYS, RUNTIME_ACCEL_TRACE_SIZE},
+    {g_accel_cmdq, RUNTIME_ACCEL_CMDQ_UNC, RUNTIME_ACCEL_CMDQ_PHYS, RUNTIME_ACCEL_CMDQ_SIZE},
+    {g_accel_cmpq, RUNTIME_ACCEL_CMPQ_UNC, RUNTIME_ACCEL_CMPQ_PHYS, RUNTIME_ACCEL_CMPQ_SIZE},
+    {g_accel_dbg2, RUNTIME_ACCEL_DBG2_UNC, RUNTIME_ACCEL_DBG2_PHYS, RUNTIME_ACCEL_DBG2_SIZE},
 };
 
 static int check_dma_args(const SharedBufferDesc *buf, size_t offset, size_t bytes, const char *tag) {
@@ -58,6 +83,12 @@ static int check_dma_args(const SharedBufferDesc *buf, size_t offset, size_t byt
     return 0;
 }
 
+static uint8_t clamp_qos_class(uint8_t qos_class) {
+    // 当前 RTL dma_rdwr 只定义了 2-bit qos class。
+    // 软件侧先在 builder 里收口，避免后面 queue mode 联调时出现隐式截断。
+    return (uint8_t)(qos_class & 0x3u);
+}
+
 void runtime_hw_adapter_init(void) {
     // 第一版不做真实硬件初始化，仅清零共享区，保证每次启动状态可复现。
     memset(g_accel_io_in, 0, sizeof(g_accel_io_in));
@@ -66,6 +97,9 @@ void runtime_hw_adapter_init(void) {
     memset(g_accel_kv, 0, sizeof(g_accel_kv));
     memset(g_accel_scratch, 0, sizeof(g_accel_scratch));
     memset(g_accel_trace, 0, sizeof(g_accel_trace));
+    memset(g_accel_cmdq, 0, sizeof(g_accel_cmdq));
+    memset(g_accel_cmpq, 0, sizeof(g_accel_cmpq));
+    memset(g_accel_dbg2, 0, sizeof(g_accel_dbg2));
 }
 
 void runtime_hw_adapter_dump_layout(FILE *fp) {
@@ -102,6 +136,26 @@ void runtime_hw_adapter_dump_layout(FILE *fp) {
         (unsigned long long)g_hw_adapter.shared_trace.cpu_uncached_addr,
         g_hw_adapter.shared_trace.phys_addr,
         g_hw_adapter.shared_trace.size);
+    fprintf(fp, "[HW_ADAPTER] CMDQ    ptr=%p cpu=0x%08llx phys=0x%08x size=0x%zx\n",
+        g_hw_adapter.shared_cmdq.cpu_ptr,
+        (unsigned long long)g_hw_adapter.shared_cmdq.cpu_uncached_addr,
+        g_hw_adapter.shared_cmdq.phys_addr,
+        g_hw_adapter.shared_cmdq.size);
+    fprintf(fp, "[HW_ADAPTER] CMPQ    ptr=%p cpu=0x%08llx phys=0x%08x size=0x%zx\n",
+        g_hw_adapter.shared_cmpq.cpu_ptr,
+        (unsigned long long)g_hw_adapter.shared_cmpq.cpu_uncached_addr,
+        g_hw_adapter.shared_cmpq.phys_addr,
+        g_hw_adapter.shared_cmpq.size);
+    fprintf(fp, "[HW_ADAPTER] DBG2    ptr=%p cpu=0x%08llx phys=0x%08x size=0x%zx\n",
+        g_hw_adapter.shared_dbg2.cpu_ptr,
+        (unsigned long long)g_hw_adapter.shared_dbg2.cpu_uncached_addr,
+        g_hw_adapter.shared_dbg2.phys_addr,
+        g_hw_adapter.shared_dbg2.size);
+    fprintf(fp, "[HW_ADAPTER] CMDQ entry_size=0x%zx depth=%zu | CMPQ entry_size=0x%zx depth=%zu\n",
+        RUNTIME_HW_CMD_ENTRY_SIZE,
+        runtime_hw_cmdq_capacity(),
+        RUNTIME_HW_CMP_ENTRY_SIZE,
+        runtime_hw_cmpq_capacity());
 }
 
 void runtime_hw_adapter_trace_op(const char *op_name, int layer_idx, int elem_count) {
@@ -158,8 +212,11 @@ int runtime_hw_dma_store(void *dst, const SharedBufferDesc *src, size_t src_offs
 int runtime_hw_submit_job(const char *job_kind, const void *job) {
     // 这里保留“提交”语义边界。真实硬件版本会在此处：
     // 1) 写 MMIO 描述符；
+    //    或者把 descriptor enqueue 到独立的 CMDQ 窗口；
     // 2) 触发启动；
     // 3) 记录 job id / trace marker。
+    // 当前默认仍然视为 legacy 路径，不在这里切换到 queue mode，
+    // 这样可以先冻结地址/内存图，再单独做 RTL 联调。
     if (!job_kind || !job) return -1;
     fprintf(stdout, "[HW_ADAPTER] submit job_kind=%s\n", job_kind);
     return 0;
@@ -174,6 +231,76 @@ int runtime_hw_wait_done(uint32_t timeout_cycle) {
 void runtime_hw_soft_reset(void) {
     // 软复位时清空共享区，模拟硬件 reset 后的干净状态。
     runtime_hw_adapter_init();
+}
+
+int runtime_hw_init_cmd_entry(
+    RuntimeHwCmdEntry *entry,
+    RuntimeHwCmdOpcode opcode,
+    uint32_t job_id,
+    uint32_t addr,
+    uint16_t len_bytes,
+    uint8_t qos_class,
+    uint8_t stride_en,
+    uint16_t line_size,
+    uint16_t line_stride
+) {
+    if (!entry) return -1;
+
+    // 这里冻结的是“最小 command 合同”，字段直接贴合当前 dma_rdwr：
+    // - opcode      <-> cmd_rw_i
+    // - addr        <-> cmd_addr_i
+    // - len_bytes   <-> cmd_len_bytes_i
+    // - qos_class   <-> cmd_qos_class_i
+    // - stride_en   <-> cmd_stride_en_i
+    // - line_size   <-> cmd_line_size_i
+    // - line_stride <-> cmd_line_stride_i
+    memset(entry, 0, sizeof(*entry));
+    entry->opcode = (uint8_t)opcode;
+    entry->flags = 0;
+    entry->qos_class = clamp_qos_class(qos_class);
+    entry->addr = addr;
+    entry->len_bytes = len_bytes;
+    entry->stride_en = (uint8_t)(stride_en ? 1u : 0u);
+    entry->line_size = line_size;
+    entry->line_stride = line_stride;
+    entry->job_id = job_id;
+    return 0;
+}
+
+int runtime_hw_init_cmp_entry(
+    RuntimeHwCmpEntry *entry,
+    uint32_t job_id,
+    RuntimeHwCmpStatus status,
+    uint16_t error_code,
+    uint32_t cycles,
+    uint32_t info0
+) {
+    if (!entry) return -1;
+    memset(entry, 0, sizeof(*entry));
+    entry->job_id = job_id;
+    entry->status = (uint16_t)status;
+    entry->error_code = error_code;
+    entry->cycles = cycles;
+    entry->info0 = info0;
+    return 0;
+}
+
+size_t runtime_hw_cmdq_capacity(void) {
+    return (size_t)(RUNTIME_ACCEL_CMDQ_SIZE / RUNTIME_HW_CMD_ENTRY_SIZE);
+}
+
+size_t runtime_hw_cmpq_capacity(void) {
+    return (size_t)(RUNTIME_ACCEL_CMPQ_SIZE / RUNTIME_HW_CMP_ENTRY_SIZE);
+}
+
+int runtime_hw_queue_layout_is_valid(void) {
+    // 这个检查主要给 bring-up / assert / 单测用：
+    // 只验证 queue window 和 entry 大小是否自洽，不碰具体寄存器协议。
+    if ((RUNTIME_ACCEL_CMDQ_SIZE % RUNTIME_HW_CMD_ENTRY_SIZE) != 0) return 0;
+    if ((RUNTIME_ACCEL_CMPQ_SIZE % RUNTIME_HW_CMP_ENTRY_SIZE) != 0) return 0;
+    if (runtime_hw_cmdq_capacity() == 0) return 0;
+    if (runtime_hw_cmpq_capacity() == 0) return 0;
+    return 1;
 }
 
 const SharedBufferDesc *runtime_hw_adapter_shared_in(void) {
@@ -198,4 +325,16 @@ const SharedBufferDesc *runtime_hw_adapter_shared_scratch(void) {
 
 const SharedBufferDesc *runtime_hw_adapter_shared_trace(void) {
     return &g_hw_adapter.shared_trace;
+}
+
+const SharedBufferDesc *runtime_hw_adapter_shared_cmdq(void) {
+    return &g_hw_adapter.shared_cmdq;
+}
+
+const SharedBufferDesc *runtime_hw_adapter_shared_cmpq(void) {
+    return &g_hw_adapter.shared_cmpq;
+}
+
+const SharedBufferDesc *runtime_hw_adapter_shared_dbg2(void) {
+    return &g_hw_adapter.shared_dbg2;
 }

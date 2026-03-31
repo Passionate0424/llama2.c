@@ -59,6 +59,40 @@
 
 #define RUNTIME_ACCEL_SHARED_SIZE      0x00100000u
 
+// 独立 command window：
+// 这块空间不再复用现有 1MB ACCEL_SHARED，而是从 8MB AXI SRAM 的后半段单独切出。
+// 这样可以把数据面（IO/KV/SCRATCH）和控制面（CMDQ/CMPQ）彻底分开，
+// 避免后续引入 queue 模式时打乱已经冻结的 shared buffer 布局。
+#define RUNTIME_ACCEL_CMD_WINDOW_BASE_PHYS 0x1c400000u
+#define RUNTIME_ACCEL_CMD_WINDOW_BASE_UNC  0xbc400000u
+#define RUNTIME_ACCEL_CMD_WINDOW_SIZE      0x00010000u
+
+// command queue：
+// - 第一版直接给 16KB，避免 descriptor 变厚后很快不够；
+// - 默认 4KB 对齐，便于后续按页或 ring buffer 管理。
+#define RUNTIME_ACCEL_CMDQ_PHYS        0x1c400000u
+#define RUNTIME_ACCEL_CMDQ_UNC         0xbc400000u
+#define RUNTIME_ACCEL_CMDQ_SIZE        0x00004000u
+
+// completion queue：
+// - 第一版先给 4KB；
+// - 软件/RTL 后续可在此基础上定义 entry 格式与深度。
+#define RUNTIME_ACCEL_CMPQ_PHYS        0x1c404000u
+#define RUNTIME_ACCEL_CMPQ_UNC         0xbc404000u
+#define RUNTIME_ACCEL_CMPQ_SIZE        0x00001000u
+
+// 预留的第二调试窗口：
+// - 当前不强依赖；
+// - 后续可用于 queue 调试、doorbell mirror 或 trace 扩展。
+#define RUNTIME_ACCEL_DBG2_PHYS        0x1c405000u
+#define RUNTIME_ACCEL_DBG2_UNC         0xbc405000u
+#define RUNTIME_ACCEL_DBG2_SIZE        0x00001000u
+
+// command window 剩余保留区，留给后续扩展更复杂的 queue/header/doorbell 结构。
+#define RUNTIME_ACCEL_CMD_WINDOW_RSVD_PHYS 0x1c406000u
+#define RUNTIME_ACCEL_CMD_WINDOW_RSVD_UNC  0xbc406000u
+#define RUNTIME_ACCEL_CMD_WINDOW_RSVD_SIZE 0x0000a000u
+
 // 当前阶段围绕 260K 模型固定部署，因此运行时 arena 也先按 260K 规模冻结。
 #define RUNTIME_ARENA_SIZE             0x00100000u
 

@@ -53,6 +53,14 @@ int main(int argc, char **argv) {
         else print_usage();
     }
 
+#if defined(RUNQ_DEPLOY_EMBEDDED_DEFAULTS)
+    // SoC 仿真入口通常没有 argv，给一组固定默认值，确保上电后能直接跑出可见 token。
+    if (argc <= 1) {
+        prompt = (char *)RUNTIME_PROMPTS_STABLE[0];
+        mode = "generate";
+    }
+#endif
+
     if (!prompt) prompt = "";
     if (runtime_app_init(&app, backend_kind, &cfg, seed) != 0) {
         fprintf(stderr, "runq_deploy: 初始化失败\n");
