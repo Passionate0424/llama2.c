@@ -2,6 +2,16 @@
 # example override to clang: make run CC=clang
 CC = gcc
 
+DEPLOY_COMMON_SRCS = \
+	deploy/src/runtime_frontend.c \
+	deploy/src/runtime_assets.c \
+	deploy/src/runtime_common.c \
+	deploy/src/runtime_backend_swref.c \
+	deploy/src/runtime_backend_hwstub.c \
+	deploy/src/runtime_hw_adapter.c
+
+DEPLOY_CFLAGS = -O3 -Ideploy/include -std=gnu11
+
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
 run: run.c
@@ -53,6 +63,22 @@ runembedded: runq_embedded.c
 
 .PHONY: runembeddedwin
 runembeddedwin: runembedded
+
+.PHONY: runqdeploycpu
+runqdeploycpu:
+	$(CC) $(DEPLOY_CFLAGS) -DRUNQ_DEPLOY_CPU -o runq_deploy_cpu deploy/src/runq_deploy.c $(DEPLOY_COMMON_SRCS) -lm
+
+.PHONY: runqdeployhw
+runqdeployhw:
+	$(CC) $(DEPLOY_CFLAGS) -DRUNQ_DEPLOY_HW -o runq_deploy_hw deploy/src/runq_deploy.c $(DEPLOY_COMMON_SRCS) -lm
+
+.PHONY: runqverify
+runqverify:
+	$(CC) $(DEPLOY_CFLAGS) -o runq_verify deploy/src/runq_verify.c deploy/src/runtime_verify.c $(DEPLOY_COMMON_SRCS) -lm
+
+.PHONY: exportdeployassets
+exportdeployassets:
+	python tools/export_deploy_headers.py --model-bin artifacts/stories260K/stories260K_q80.bin --tokenizer-bin artifacts/stories260K/tok512.bin
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: rungnu

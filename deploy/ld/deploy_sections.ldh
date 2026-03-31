@@ -1,0 +1,19 @@
+/* 
+ * deploy_sections.ldh
+ *
+ * 第一版先作为 linker 规划占位文件存在。
+ * 后续在对接 LoongArch / OpenLA500 链接脚本时，把：
+ * - .model_assets
+ * - .runtime_arena
+ * - .accel_shared
+ * - .accel_trace
+ * 这些 section 的真实落位补进来。
+ */
+
+SECTIONS
+{
+    .model_assets : { *(.model_assets*) }
+    .runtime_arena : { *(.runtime_arena*) }
+    .accel_shared : { *(.accel_shared*) }
+    .accel_trace : { *(.accel_trace*) }
+}

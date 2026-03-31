@@ -1,0 +1,12 @@
+{
+  "ops": [
+    "rmsnorm",
+    "linear_qkv_q",
+    "qk_matmul",
+    "softmax_row",
+    "gate_mul",
+    "residual_add"
+  ],
+  "tolerance": 1e-5,
+  "note": "当前第一版由 runq_verify 固定执行 SW_REF 与 HW_STUB 的一致性比较。"
+}
