@@ -15,6 +15,8 @@ static VerifyMetric compare_tensor(const char *label, const float *ref, const fl
     int mismatch = 0;
     metric.label = label;
     metric.elem_count = n;
+    // compare 口径保持最小集合：最大误差、平均误差、超阈值个数。
+    // 这样既方便快速定位，又不会把验证日志撑得过于冗长。
     for (int i = 0; i < n; ++i) {
         float diff = fabsf(ref[i] - dut[i]);
         if (diff > max_abs) max_abs = diff;
@@ -66,6 +68,8 @@ int runtime_run_verify_suite(void) {
     int fail_count = 0;
     const float tol = 1e-5f;
 
+    // 当前验证套件的目标不是覆盖整条生成流程，
+    // 而是逐个对齐关键算子边界，确认 HW_STUB 与 SW_REF 数学一致。
     runtime_model_init(&model);
     if (runtime_load_default_model(&model) != 0) return 1;
     runtime_backend_bind_swref(&swref, &model);

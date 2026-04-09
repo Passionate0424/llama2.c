@@ -18,11 +18,14 @@ typedef struct {
 } RuntimeConfig;
 
 typedef struct {
+    // q80 量化后的 int8 数据区。
     int8_t *q;
+    // 每个 group 对应一份缩放系数。
     float *s;
 } QuantizedTensor;
 
 typedef struct {
+    // token embedding，当前按整张 q80 表原位映射。
     QuantizedTensor *q_tokens;
     float *rms_att_weight;
     float *rms_ffn_weight;
@@ -34,22 +37,31 @@ typedef struct {
     QuantizedTensor *w2;
     QuantizedTensor *w3;
     float *rms_final_weight;
+    // 若 shared_classifier 为真，wcls 会与 q_tokens 共享底层资产。
     QuantizedTensor *wcls;
 } RuntimeWeights;
 
 typedef struct {
+    // x 表示当前 token 在各层之间流动的主残差流。
     float *x;
+    // xb / xb2 是 attention 与 FFN 子图复用的中间缓冲。
     float *xb;
     float *xb2;
+    // hb / hb2 是 FFN hidden 维度上的中间结果。
     float *hb;
     float *hb2;
+    // xq / hq 是激活侧量化后的临时视图，不拥有独立生命周期。
     QuantizedTensor xq;
     QuantizedTensor hq;
+    // 当前 token 的 q/k/v 向量。
     float *q;
     float *k;
     float *v;
+    // attention 缓冲按 [head][time] 组织。
     float *att;
+    // 最终 lm_head 输出的 logits。
     float *logits;
+    // 按 [layer][time][kv_dim] 组织的 KV cache。
     float *key_cache;
     float *value_cache;
 } RuntimeState;
@@ -58,8 +70,10 @@ typedef struct {
     RuntimeConfig config;
     RuntimeWeights weights;
     RuntimeState state;
+    // 原始模型头文件数组及其大小，主要给布局校验使用。
     const unsigned char *raw_model_data;
     size_t raw_model_size;
+    // q80 权重/激活量化采用的 group size。
     int group_size;
 } RuntimeModel;
 

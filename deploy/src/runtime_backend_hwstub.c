@@ -14,6 +14,7 @@ static void stub_trace(RuntimeBackend *backend, const char *label) {
 }
 
 static int hwstub_group_size(RuntimeBackend *backend) {
+    // HW_STUB 与 SW_REF 必须共享同一组量化粒度，否则 compare 将失去意义。
     return backend->model->group_size;
 }
 
@@ -56,8 +57,16 @@ static void hwstub_linear_qkv(RuntimeBackend *backend, float *q, float *k, float
     RuntimeState *state = &backend->model->state;
     int dim = backend->model->config.dim;
     int kv_dim = (backend->model->config.dim * backend->model->config.n_kv_heads) / backend->model->config.n_heads;
+    RuntimeHwLinearJob linear_job;
     stub_trace(backend, "linear_qkv");
     runtime_hw_adapter_trace_op("linear_qkv", layer_idx, dim);
+    // HW_STUB 当前分两段执行：
+    // 1. 先走 adapter/job 提交边界，验证硬件调用顺序；
+    // 2. 再落回软件 q80 matmul，保证结果仍可与 SW_REF 逐项比较。
+    if (runtime_hw_prepare_linear_job(&linear_job, "linear_qkv", layer_idx, (size_t)dim) == 0) {
+        (void)runtime_hw_submit_job("linear", &linear_job);
+        (void)runtime_hw_wait_done(0u);
+    }
     memcpy(state->xb, x, (size_t)dim * sizeof(float));
     quantize_tensor(&state->xq, state->xb, dim, hwstub_group_size(backend));
     matmul_ref(q, &state->xq, backend->model->weights.wq + layer_idx, dim, dim, hwstub_group_size(backend));
@@ -168,6 +177,7 @@ static void hwstub_lm_head(RuntimeBackend *backend, float *logits, const float *
     RuntimeState *state = &backend->model->state;
     stub_trace(backend, "lm_head");
     runtime_hw_adapter_trace_op("lm_head", 0, backend->model->config.dim);
+    // 最终分类头也保持与部署态一致的量化口径，避免“前面像硬件、最后一步变纯 float”。
     memcpy(state->x, x, (size_t)backend->model->config.dim * sizeof(float));
     quantize_tensor(&state->xq, state->x, backend->model->config.dim, hwstub_group_size(backend));
     matmul_ref(logits, &state->xq, backend->model->weights.wcls, backend->model->config.dim, backend->model->config.vocab_size, hwstub_group_size(backend));

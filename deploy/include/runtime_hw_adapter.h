@@ -19,6 +19,12 @@ typedef struct {
     const SharedBufferDesc *in;
     const SharedBufferDesc *out;
     const SharedBufferDesc *param;
+    // queue-shadow：
+    // - 第一版先在软件侧把 DMA 级 entry 组包并落到 CMDQ backing storage；
+    // - 默认执行语义仍走 legacy submit，不在这里切默认 queue mode。
+    uint32_t cmdq_shadow_offset;
+    uint32_t cmdq_shadow_count;
+    uint32_t submit_job_id;
 } RuntimeHwLinearJob;
 
 typedef struct {

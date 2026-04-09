@@ -6,6 +6,7 @@
 #include "runtime_common.h"
 
 static int swref_group_size(RuntimeBackend *backend) {
+    // group_size 统一从已加载模型读取，确保所有算子看到同一套 q80 配置。
     return backend->model->group_size;
 }
 
@@ -63,6 +64,7 @@ static void swref_linear_attn_o(RuntimeBackend *backend, float *out, const float
     RuntimeModel *model = backend->model;
     int dim = model->config.dim;
     RuntimeState *state = &model->state;
+    // attention 各 head 已在 x 中拼接完成，这里只负责输出投影回主残差维度。
     memcpy(state->xb, x, (size_t)dim * sizeof(float));
     quantize_tensor(&state->xq, state->xb, dim, swref_group_size(backend));
     matmul_ref(out, &state->xq, model->weights.wo + layer_idx, dim, dim, swref_group_size(backend));
@@ -95,6 +97,7 @@ static void swref_av_matmul(RuntimeBackend *backend, float *out, const float *at
     int kv_dim = (model->config.dim * model->config.n_kv_heads) / model->config.n_heads;
     int kv_mul = model->config.n_heads / model->config.n_kv_heads;
     int head_size = dim / model->config.n_heads;
+    // 单个 head 的上下文向量按时间维累加，结果直接写到该 head 对应输出片段。
     memset(out, 0, (size_t)head_size * sizeof(float));
     for (int t = 0; t <= pos; ++t) {
         const float *v_cached = value_cache + t * kv_dim + (head_idx / kv_mul) * head_size;
@@ -151,6 +154,7 @@ static void swref_final_norm(RuntimeBackend *backend, float *out, const float *x
 static void swref_lm_head(RuntimeBackend *backend, float *logits, const float *x) {
     RuntimeModel *model = backend->model;
     RuntimeState *state = &model->state;
+    // lm_head 沿用部署态 q80 权重口径，避免 SW_REF 与最终部署路径脱节。
     memcpy(state->x, x, (size_t)model->config.dim * sizeof(float));
     quantize_tensor(&state->xq, state->x, model->config.dim, swref_group_size(backend));
     matmul_ref(logits, &state->xq, model->weights.wcls, model->config.dim, model->config.vocab_size, swref_group_size(backend));

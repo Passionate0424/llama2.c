@@ -25,6 +25,8 @@ int grouped_scale_count(int n, int group_size) {
 }
 
 static void runtime_prepare_arena(void) {
+    // arena 以“整次模型加载/初始化”为粒度复位，
+    // 不支持运行中碎片化回收，这正是部署态想要的固定布局行为。
     if (!g_runtime_arena_inited) {
         arena_init(&g_runtime_arena, g_runtime_arena_storage, sizeof(g_runtime_arena_storage));
         g_runtime_arena_inited = 1;

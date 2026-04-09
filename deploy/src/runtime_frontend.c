@@ -95,7 +95,8 @@ int runtime_app_init(
     const RuntimeDecodeConfig *decode_cfg,
     unsigned long long seed
 ) {
-    // 第一版固定使用默认资产和默认 decode 配置，先把主运行链路收敛下来。
+    // 初始化顺序固定为：模型 -> tokenizer -> sampler -> backend。
+    // 这样一旦中途失败，可以按资源依赖关系回滚，避免悬空状态。
     memset(app, 0, sizeof(*app));
     runtime_model_init(&app->model);
     if (runtime_load_default_model(&app->model) != 0) return -1;

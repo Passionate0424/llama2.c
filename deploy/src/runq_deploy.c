@@ -36,6 +36,7 @@ int main(int argc, char **argv) {
     int ret = 0;
 
 #if defined(RUNQ_DEPLOY_HW)
+    // backend 选择在编译期冻结，避免部署版在运行时携带多余的分叉逻辑。
     backend_kind = RUNTIME_BACKEND_HWSTUB;
 #endif
 

@@ -46,6 +46,8 @@ static int validate_model_layout(
 ) {
     size_t used = (size_t)header_size;
     int head_size;
+    // 这里的目标是“按部署资产真实布局推导一次总占用”，
+    // 提前发现头文件导出不完整、group_size 不匹配或结构版本漂移。
     if ((size_t)header_size > raw_model_size) {
         fprintf(stderr, "runtime_load_default_model: header_size=%d 超过模型总大小=%zu\n", header_size, raw_model_size);
         return -1;
