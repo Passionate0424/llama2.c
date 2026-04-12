@@ -70,16 +70,15 @@ static void swref_linear_attn_o(RuntimeBackend *backend, float *out, const float
     matmul_ref(out, &state->xq, model->weights.wo + layer_idx, dim, dim, swref_group_size(backend));
 }
 
-static void swref_qk_matmul(RuntimeBackend *backend, float *att, const float *q, const float *key_cache, int pos, int head_idx) {
+static void swref_qk_matmul(RuntimeBackend *backend, float *att, const float *q, const RuntimeKvCacheLayerView *key_view, int pos, int head_idx) {
     RuntimeModel *model = backend->model;
     int dim = model->config.dim;
-    int kv_dim = (model->config.dim * model->config.n_kv_heads) / model->config.n_heads;
-    int kv_mul = model->config.n_heads / model->config.n_kv_heads;
     int head_size = dim / model->config.n_heads;
     const float *q_head = q + head_idx * head_size;
-    // 当前只实现最小 decode 参考路径：单 head 的 QK^T 行得分。
+    // 当前先通过 layer view 读取 legacy float backing；
+    // 后续切到 KV_MAIN int8 data/scale 时，只替换 accessor 的解释逻辑即可。
     for (int t = 0; t <= pos; ++t) {
-        const float *k_cached = key_cache + t * kv_dim + (head_idx / kv_mul) * head_size;
+        const float *k_cached = runtime_kv_cache_head_ptr(key_view, t, head_idx);
         float score = 0.0f;
         for (int i = 0; i < head_size; ++i) score += q_head[i] * k_cached[i];
         att[t] = score / sqrtf((float)head_size);
@@ -91,16 +90,14 @@ static void swref_softmax_row(RuntimeBackend *backend, float *row, int size) {
     softmax_ref(row, size);
 }
 
-static void swref_av_matmul(RuntimeBackend *backend, float *out, const float *att, const float *value_cache, int pos, int head_idx) {
+static void swref_av_matmul(RuntimeBackend *backend, float *out, const float *att, const RuntimeKvCacheLayerView *value_view, int pos, int head_idx) {
     RuntimeModel *model = backend->model;
     int dim = model->config.dim;
-    int kv_dim = (model->config.dim * model->config.n_kv_heads) / model->config.n_heads;
-    int kv_mul = model->config.n_heads / model->config.n_kv_heads;
     int head_size = dim / model->config.n_heads;
     // 单个 head 的上下文向量按时间维累加，结果直接写到该 head 对应输出片段。
     memset(out, 0, (size_t)head_size * sizeof(float));
     for (int t = 0; t <= pos; ++t) {
-        const float *v_cached = value_cache + t * kv_dim + (head_idx / kv_mul) * head_size;
+        const float *v_cached = runtime_kv_cache_head_ptr(value_view, t, head_idx);
         float a = att[t];
         for (int i = 0; i < head_size; ++i) out[i] += a * v_cached[i];
     }

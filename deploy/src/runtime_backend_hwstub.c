@@ -84,17 +84,15 @@ static void hwstub_linear_attn_o(RuntimeBackend *backend, float *out, const floa
     matmul_ref(out, &state->xq, backend->model->weights.wo + layer_idx, dim, dim, hwstub_group_size(backend));
 }
 
-static void hwstub_qk_matmul(RuntimeBackend *backend, float *att, const float *q, const float *key_cache, int pos, int head_idx) {
+static void hwstub_qk_matmul(RuntimeBackend *backend, float *att, const float *q, const RuntimeKvCacheLayerView *key_view, int pos, int head_idx) {
     RuntimeModel *model = backend->model;
     int dim = model->config.dim;
-    int kv_dim = (model->config.dim * model->config.n_kv_heads) / model->config.n_heads;
-    int kv_mul = model->config.n_heads / model->config.n_kv_heads;
     int head_size = dim / model->config.n_heads;
     const float *q_head = q + head_idx * head_size;
     stub_trace(backend, "qk_matmul");
     runtime_hw_adapter_trace_op("qk_matmul", head_idx, pos + 1);
     for (int t = 0; t <= pos; ++t) {
-        const float *k_cached = key_cache + t * kv_dim + (head_idx / kv_mul) * head_size;
+        const float *k_cached = runtime_kv_cache_head_ptr(key_view, t, head_idx);
         float score = 0.0f;
         for (int i = 0; i < head_size; ++i) score += q_head[i] * k_cached[i];
         att[t] = score / sqrtf((float)head_size);
@@ -107,17 +105,15 @@ static void hwstub_softmax_row(RuntimeBackend *backend, float *row, int size) {
     softmax_ref(row, size);
 }
 
-static void hwstub_av_matmul(RuntimeBackend *backend, float *out, const float *att, const float *value_cache, int pos, int head_idx) {
+static void hwstub_av_matmul(RuntimeBackend *backend, float *out, const float *att, const RuntimeKvCacheLayerView *value_view, int pos, int head_idx) {
     RuntimeModel *model = backend->model;
     int dim = model->config.dim;
-    int kv_dim = (model->config.dim * model->config.n_kv_heads) / model->config.n_heads;
-    int kv_mul = model->config.n_heads / model->config.n_kv_heads;
     int head_size = dim / model->config.n_heads;
     stub_trace(backend, "av_matmul");
     runtime_hw_adapter_trace_op("av_matmul", head_idx, pos + 1);
     memset(out, 0, (size_t)head_size * sizeof(float));
     for (int t = 0; t <= pos; ++t) {
-        const float *v_cached = value_cache + t * kv_dim + (head_idx / kv_mul) * head_size;
+        const float *v_cached = runtime_kv_cache_head_ptr(value_view, t, head_idx);
         for (int i = 0; i < head_size; ++i) out[i] += att[t] * v_cached[i];
     }
 }

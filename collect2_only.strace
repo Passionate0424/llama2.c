@@ -1,0 +1,18 @@
+--- Process 101288 created
+--- Process 101288 loaded C:\Windows\System32\ntdll.dll at 00007ffaa0e80000
+--- Process 101288 loaded C:\Windows\System32\kernel32.dll at 00007ffa9f820000
+--- Process 101288 loaded C:\Windows\System32\KernelBase.dll at 00007ffa9da10000
+--- Process 101288 loaded C:\Windows\System32\apphelp.dll at 00007ffa99030000
+--- Process 101288 loaded C:\Windows\System32\msvcrt.dll at 00007ffa9fd50000
+--- Process 101288 thread 65608 created
+--- Process 101288 thread 25856 created
+--- Process 101288 thread 63216 created
+--- Process 101288 loaded D:\Git\mingw64\bin\libgcc_s_seh-1.dll at 00007ffa42e80000
+--- Process 101288 loaded D:\Git\mingw64\bin\libwinpthread-1.dll at 00007ffa94e40000
+--- Process 101288 loaded C:\Windows\System32\cryptbase.dll at 00007ffa9cc60000
+--- Process 101288 loaded C:\Windows\System32\bcryptprimitives.dll at 00007ffa9d760000
+--- Process 101288 loaded C:\Windows\System32\sechost.dll at 00007ffa9f1e0000
+--- Process 101288 thread 65608 exited with status 0x0
+--- Process 101288 thread 25856 exited with status 0x0
+--- Process 101288 thread 63216 exited with status 0x0
+--- Process 101288 exited with status 0x0

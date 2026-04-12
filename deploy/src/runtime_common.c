@@ -1,8 +1,10 @@
 #include "runtime_common.h"
 #include "runtime_backend.h"
+#include "runtime_hw_adapter.h"
 #include "runtime_memory_map.h"
 
 #include <ctype.h>
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,7 @@ __attribute__((section(".runtime_arena"), aligned(64)))
 
 static RuntimeArena g_runtime_arena;
 static int g_runtime_arena_inited = 0;
+static int g_runtime_kv_int8_mode = 0;
 
 int grouped_scale_count(int n, int group_size) {
     if (group_size <= 0 || n <= 0) return 0;
@@ -132,6 +135,16 @@ void runtime_malloc_state(RuntimeState *state, const RuntimeConfig *config, int 
     ptr = arena_alloc(&g_runtime_arena, (size_t)config->n_layers * (size_t)config->seq_len * (size_t)kv_dim * sizeof(float), 64);
     state->value_cache = (float *)ptr;
 
+    runtime_refresh_kv_main_regions(state, config);
+    runtime_seed_kv_main_regions(state, config, kv_dim);
+
+    // 当前 token 的 k/v 仍保留为过渡 row buffer，方便继续迭代；
+    // 但正式历史路径已经由 view + KV_MAIN region 接管。
+    state->key_cache_main_data_region.cpu_ptr = state->key_cache;
+    state->value_cache_main_data_region.cpu_ptr = state->value_cache;
+    state->key_cache_main_scale_region.cpu_ptr = NULL;
+    state->value_cache_main_scale_region.cpu_ptr = NULL;
+
     if (!state->x || !state->xb || !state->xb2 || !state->hb || !state->hb2 ||
         !state->xq.q || !state->xq.s || !state->hq.q || !state->hq.s ||
         !state->q || !state->k || !state->v || !state->att || !state->logits ||
@@ -220,6 +233,328 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each, int gr
     }
     *ptr = p;
     return res;
+}
+
+void runtime_init_kv_cache_layer_view(
+    RuntimeKvCacheLayerView *view,
+    const SharedBufferDesc *data_region,
+    const SharedBufferDesc *scale_region,
+    float *legacy_float_data,
+    int seq_len,
+    int kv_dim,
+    int head_size,
+    int kv_mul,
+    size_t data_stride_bytes,
+    size_t scale_stride_bytes
+) {
+    if (!view) {
+        return;
+    }
+    view->data_region = data_region;
+    view->scale_region = scale_region;
+    view->legacy_float_data = legacy_float_data;
+    view->seq_len = seq_len;
+    view->kv_dim = kv_dim;
+    view->head_size = head_size;
+    view->kv_mul = kv_mul;
+    view->data_stride_bytes = data_stride_bytes;
+    view->scale_stride_bytes = scale_stride_bytes;
+}
+
+size_t runtime_kv_cache_row_data_offset(const RuntimeKvCacheLayerView *view, int time_idx) {
+    if (!view || time_idx < 0) {
+        return 0u;
+    }
+    return (size_t)time_idx * view->data_stride_bytes;
+}
+
+int runtime_kv_cache_uses_int8_data(const RuntimeKvCacheLayerView *view) {
+    return view && runtime_get_kv_int8_mode() && view->data_region && view->data_region->cpu_ptr;
+}
+
+void runtime_set_kv_int8_mode(int enabled) {
+    g_runtime_kv_int8_mode = enabled ? 1 : 0;
+}
+
+int runtime_get_kv_int8_mode(void) {
+    return g_runtime_kv_int8_mode;
+}
+
+void runtime_kv_cache_write_row(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row) {
+    if (!view || !src_row || !view->legacy_float_data) {
+        return;
+    }
+    memcpy(view->legacy_float_data + (size_t)time_idx * (size_t)view->kv_dim,
+           src_row,
+           (size_t)view->kv_dim * sizeof(float));
+}
+
+void runtime_kv_cache_write_row_int8(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row) {
+    size_t row_off;
+    int i;
+    unsigned char *dst;
+    float max_abs = 0.0f;
+    float scale;
+
+    if (!view || !src_row || !view->data_region || !view->data_region->cpu_ptr) {
+        return;
+    }
+    row_off = runtime_kv_cache_row_data_offset(view, time_idx);
+    dst = (unsigned char *)view->data_region->cpu_ptr + row_off;
+    for (i = 0; i < view->kv_dim; ++i) {
+        float v = fabsf(src_row[i]);
+        if (v > max_abs) max_abs = v;
+    }
+    scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : (1.0f / 127.0f);
+    for (i = 0; i < view->kv_dim; ++i) {
+        ((int8_t *)dst)[i] = (int8_t)roundf(src_row[i] / scale);
+    }
+    if (view->scale_region && view->scale_region->cpu_ptr && view->scale_stride_bytes >= sizeof(float)) {
+        float *scale_dst = (float *)((unsigned char *)view->scale_region->cpu_ptr +
+                                     (size_t)time_idx * view->scale_stride_bytes);
+        *scale_dst = scale;
+    }
+    if (view->legacy_float_data) {
+        memcpy(view->legacy_float_data + (size_t)time_idx * (size_t)view->kv_dim,
+               src_row,
+               (size_t)view->kv_dim * sizeof(float));
+    }
+}
+
+void runtime_kv_cache_read_row_int8(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row) {
+    size_t row_off;
+    const int8_t *src;
+    float scale = 1.0f / 127.0f;
+    int i;
+
+    if (!view || !dst_row || !view->data_region || !view->data_region->cpu_ptr) {
+        return;
+    }
+    row_off = runtime_kv_cache_row_data_offset(view, time_idx);
+    src = (const int8_t *)((const unsigned char *)view->data_region->cpu_ptr + row_off);
+    if (view->scale_region && view->scale_region->cpu_ptr && view->scale_stride_bytes >= sizeof(float)) {
+        const float *scale_src = (const float *)((const unsigned char *)view->scale_region->cpu_ptr +
+                                                 (size_t)time_idx * view->scale_stride_bytes);
+        scale = *scale_src;
+    }
+    for (i = 0; i < view->kv_dim; ++i) {
+        dst_row[i] = (float)src[i] * scale;
+    }
+}
+
+void runtime_kv_cache_extract_row(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row) {
+    if (!view || !dst_row) {
+        return;
+    }
+    if (runtime_kv_cache_uses_int8_data(view)) {
+        runtime_kv_cache_read_row_int8(view, time_idx, dst_row);
+        return;
+    }
+    if (view->legacy_float_data) {
+        memcpy(dst_row,
+               view->legacy_float_data + (size_t)time_idx * (size_t)view->kv_dim,
+               (size_t)view->kv_dim * sizeof(float));
+    }
+}
+
+const float *runtime_kv_cache_head_ptr(const RuntimeKvCacheLayerView *view, int time_idx, int head_idx) {
+    static float g_kv_row_scratch[RUNTIME_MODEL_MAX_DIM];
+    int kv_head_idx;
+    if (!view || view->kv_mul <= 0) {
+        return NULL;
+    }
+    kv_head_idx = head_idx / view->kv_mul;
+    if (runtime_kv_cache_uses_int8_data(view)) {
+        runtime_kv_cache_extract_row(view, time_idx, g_kv_row_scratch);
+        return g_kv_row_scratch + (size_t)kv_head_idx * (size_t)view->head_size;
+    }
+    if (!view->legacy_float_data) {
+        return NULL;
+    }
+    return view->legacy_float_data +
+           (size_t)time_idx * (size_t)view->kv_dim +
+           (size_t)kv_head_idx * (size_t)view->head_size;
+}
+
+void runtime_refresh_kv_main_regions(RuntimeState *state, const RuntimeConfig *config) {
+    int kv_dim;
+    size_t float_bytes_per_row;
+    if (!state || !config) {
+        return;
+    }
+    kv_dim = (config->dim * config->n_kv_heads) / config->n_heads;
+    float_bytes_per_row = (size_t)kv_dim * sizeof(float);
+    state->key_cache_main_data_region.cpu_uncached_addr = RUNTIME_KEY_CACHE_MAIN_DATA_UNC;
+    state->key_cache_main_data_region.phys_addr = RUNTIME_KEY_CACHE_MAIN_DATA_PHYS;
+    state->key_cache_main_data_region.size = (size_t)config->n_layers * (size_t)config->seq_len * float_bytes_per_row;
+    state->key_cache_main_scale_region.cpu_uncached_addr = RUNTIME_KEY_CACHE_MAIN_SCALE_UNC;
+    state->key_cache_main_scale_region.phys_addr = RUNTIME_KEY_CACHE_MAIN_SCALE_PHYS;
+    state->key_cache_main_scale_region.size = RUNTIME_KEY_CACHE_MAIN_SCALE_SIZE;
+    state->value_cache_main_data_region.cpu_uncached_addr = RUNTIME_VALUE_CACHE_MAIN_DATA_UNC;
+    state->value_cache_main_data_region.phys_addr = RUNTIME_VALUE_CACHE_MAIN_DATA_PHYS;
+    state->value_cache_main_data_region.size = (size_t)config->n_layers * (size_t)config->seq_len * float_bytes_per_row;
+    state->value_cache_main_scale_region.cpu_uncached_addr = RUNTIME_VALUE_CACHE_MAIN_SCALE_UNC;
+    state->value_cache_main_scale_region.phys_addr = RUNTIME_VALUE_CACHE_MAIN_SCALE_PHYS;
+    state->value_cache_main_scale_region.size = RUNTIME_VALUE_CACHE_MAIN_SCALE_SIZE;
+}
+
+void runtime_seed_kv_main_regions(RuntimeState *state, const RuntimeConfig *config, int kv_dim) {
+    size_t total_bytes = (size_t)config->n_layers * (size_t)config->seq_len * (size_t)kv_dim * sizeof(float);
+    if (!state) {
+        return;
+    }
+    state->key_cache_main_data_region.cpu_ptr = state->key_cache;
+    state->key_cache_main_data_region.size = total_bytes;
+    state->key_cache_main_scale_region.cpu_ptr = NULL;
+    state->value_cache_main_data_region.cpu_ptr = state->value_cache;
+    state->value_cache_main_data_region.size = total_bytes;
+    state->value_cache_main_scale_region.cpu_ptr = NULL;
+}
+
+int runtime_kv_has_legacy_float_backing(const RuntimeState *state) {
+    return state && state->key_cache && state->value_cache;
+}
+
+float *runtime_key_cache_layer_ptr(RuntimeState *state, int layer_idx, int seq_len, int kv_dim) {
+    return state->key_cache + (size_t)layer_idx * (size_t)seq_len * (size_t)kv_dim;
+}
+
+float *runtime_value_cache_layer_ptr(RuntimeState *state, int layer_idx, int seq_len, int kv_dim) {
+    return state->value_cache + (size_t)layer_idx * (size_t)seq_len * (size_t)kv_dim;
+}
+
+float *runtime_key_cache_row_ptr(RuntimeState *state, int layer_idx, int pos, int seq_len, int kv_dim) {
+    return runtime_key_cache_layer_ptr(state, layer_idx, seq_len, kv_dim) + (size_t)pos * (size_t)kv_dim;
+}
+
+float *runtime_value_cache_row_ptr(RuntimeState *state, int layer_idx, int pos, int seq_len, int kv_dim) {
+    return runtime_value_cache_layer_ptr(state, layer_idx, seq_len, kv_dim) + (size_t)pos * (size_t)kv_dim;
+}
+
+void runtime_linear_qkv_row(RuntimeBackend *backend, float *q, float *k_row, float *v_row, const float *x, int layer_idx) {
+    backend->ops->linear_qkv(backend, q, k_row, v_row, x, layer_idx);
+}
+
+void runtime_clear_transient_kv(RuntimeState *state, int kv_dim) {
+    if (!state || kv_dim <= 0) {
+        return;
+    }
+    if (state->k) memset(state->k, 0, (size_t)kv_dim * sizeof(float));
+    if (state->v) memset(state->v, 0, (size_t)kv_dim * sizeof(float));
+}
+
+void runtime_init_layer_kv_views(
+    RuntimeModel *model,
+    int layer_idx,
+    RuntimeKvCacheLayerView *key_view,
+    RuntimeKvCacheLayerView *value_view,
+    int bind_hw_regions
+) {
+    RuntimeConfig *config = &model->config;
+    RuntimeState *state = &model->state;
+    int kv_dim = (config->dim * config->n_kv_heads) / config->n_heads;
+    int head_size = config->dim / config->n_heads;
+    int kv_mul = config->n_heads / config->n_kv_heads;
+    float *layer_key_cache = runtime_key_cache_layer_ptr(state, layer_idx, config->seq_len, kv_dim);
+    float *layer_value_cache = runtime_value_cache_layer_ptr(state, layer_idx, config->seq_len, kv_dim);
+    runtime_init_kv_cache_layer_view(
+        key_view,
+        &state->key_cache_main_data_region,
+        &state->key_cache_main_scale_region,
+        layer_key_cache,
+        config->seq_len,
+        kv_dim,
+        head_size,
+        kv_mul,
+        (size_t)kv_dim * sizeof(float),
+        sizeof(float));
+    runtime_init_kv_cache_layer_view(
+        value_view,
+        &state->value_cache_main_data_region,
+        &state->value_cache_main_scale_region,
+        layer_value_cache,
+        config->seq_len,
+        kv_dim,
+        head_size,
+        kv_mul,
+        (size_t)kv_dim * sizeof(float),
+        sizeof(float));
+    if (bind_hw_regions) {
+        key_view->data_region = runtime_hw_adapter_key_cache_main_data();
+        key_view->scale_region = runtime_hw_adapter_key_cache_main_scale();
+        value_view->data_region = runtime_hw_adapter_value_cache_main_data();
+        value_view->scale_region = runtime_hw_adapter_value_cache_main_scale();
+    }
+}
+
+void runtime_commit_kv_rows(
+    RuntimeModel *model,
+    RuntimeKvCacheLayerView *key_view,
+    RuntimeKvCacheLayerView *value_view,
+    int pos,
+    const float *key_row,
+    const float *value_row
+) {
+    (void)model;
+    if (runtime_get_kv_int8_mode()) {
+        runtime_kv_cache_write_row_int8(key_view, pos, key_row);
+        runtime_kv_cache_write_row_int8(value_view, pos, value_row);
+        return;
+    }
+    runtime_kv_cache_write_row(key_view, pos, key_row);
+    runtime_kv_cache_write_row(value_view, pos, value_row);
+}
+
+void runtime_trace_kv_row(FILE *fp, const char *label, const RuntimeKvCacheLayerView *view, int time_idx) {
+    if (!fp || !label || !view) {
+        return;
+    }
+    fprintf(fp, "[KV_TRACE] %s t=%d row_off=0x%zx cpu=0x%08llx phys=0x%08x\n",
+        label,
+        time_idx,
+        runtime_kv_cache_row_data_offset(view, time_idx),
+        view->data_region ? (unsigned long long)view->data_region->cpu_uncached_addr : 0ull,
+        view->data_region ? view->data_region->phys_addr : 0u);
+}
+
+const RuntimeKvCacheLayerView *runtime_key_view(const RuntimeKvCacheLayerView *view) {
+    return view;
+}
+
+const RuntimeKvCacheLayerView *runtime_value_view(const RuntimeKvCacheLayerView *view) {
+    return view;
+}
+
+void runtime_write_kv_rows(
+    RuntimeModel *model,
+    RuntimeKvCacheLayerView *key_view,
+    RuntimeKvCacheLayerView *value_view,
+    int pos,
+    const float *key_row,
+    const float *value_row
+) {
+    runtime_commit_kv_rows(model, key_view, value_view, pos, key_row, value_row);
+}
+
+void runtime_extract_kv_row(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row) {
+    runtime_kv_cache_extract_row(view, time_idx, dst_row);
+}
+
+void runtime_apply_rope_to_qk_row(float *q, float *k_row, int dim, int kv_dim, int head_size, int pos) {
+    apply_rope_inplace(q, k_row, dim, kv_dim, head_size, pos);
+}
+
+void runtime_bind_kv_view_to_hw_regions(RuntimeKvCacheLayerView *view, int is_value_region) {
+    if (!view) {
+        return;
+    }
+    if (is_value_region) {
+        view->data_region = runtime_hw_adapter_value_cache_main_data();
+        view->scale_region = runtime_hw_adapter_value_cache_main_scale();
+    } else {
+        view->data_region = runtime_hw_adapter_key_cache_main_data();
+        view->scale_region = runtime_hw_adapter_key_cache_main_scale();
+    }
 }
 
 void rmsnorm_ref(float *out, const float *x, const float *weight, int size) {
@@ -312,12 +647,18 @@ int encode_text(
         qsort(tokenizer->sorted_vocab, (size_t)tokenizer->vocab_size, sizeof(TokenIndex), compare_tokens);
     }
 
+    if (text == NULL) {
+        fprintf(stderr, "encode_text: text 不能为空\n");
+        exit(EXIT_FAILURE);
+    }
+
     char *str_buffer = (char *)malloc((size_t)(tokenizer->max_token_length * 2 + 3));
     if (!str_buffer) {
         fprintf(stderr, "encode_text: 临时缓冲分配失败\n");
         exit(EXIT_FAILURE);
     }
 
+    size_t str_len = 0;
     int count = 0;
     if (bos) {
         if (count >= token_capacity) {
@@ -338,18 +679,32 @@ int encode_text(
     }
 
     for (char *c = text; *c != '\0'; ++c) {
-        sprintf(str_buffer, "%c", *c);
-        int id = str_lookup(str_buffer, tokenizer->sorted_vocab, tokenizer->vocab_size);
-        if (count >= token_capacity) {
-            free(str_buffer);
-            return -1;
+        // 按 UTF-8 codepoint 聚合后再查词表，避免把中文等多字节字符错误拆散。
+        if ((*c & 0xC0) != 0x80) {
+            str_len = 0;
         }
+        str_buffer[str_len++] = *c;
+        str_buffer[str_len] = '\0';
+        if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) {
+            continue;
+        }
+        int id = str_lookup(str_buffer, tokenizer->sorted_vocab, tokenizer->vocab_size);
         if (id != -1) {
+            if (count >= token_capacity) {
+                free(str_buffer);
+                return -1;
+            }
             tokens[count++] = id;
         } else {
-            unsigned char byte = (unsigned char)*c;
-            tokens[count++] = byte + 3;
+            for (size_t i = 0; i < str_len; ++i) {
+                if (count >= token_capacity) {
+                    free(str_buffer);
+                    return -1;
+                }
+                tokens[count++] = (unsigned char)str_buffer[i] + 3;
+            }
         }
+        str_len = 0;
     }
 
     while (1) {
@@ -402,6 +757,15 @@ static int compare_prob_index(const void *a, const void *b) {
     return 0;
 }
 
+static int runtime_env_flag_enabled(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return 0;
+    if (strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0) return 0;
+    if (strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0) return 0;
+    return 1;
+}
+
 static unsigned int random_u32(unsigned long long *state) {
     *state ^= *state >> 12;
     *state ^= *state << 25;
@@ -413,65 +777,115 @@ static float random_f32(unsigned long long *state) {
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-static int sample_mult(float *probabilities, int n, float coin) {
+static int sample_mult_candidates(const ProbIndex *candidates, int n, float total_prob, float coin) {
+    float r = coin * total_prob;
     float cdf = 0.0f;
     for (int i = 0; i < n; ++i) {
-        cdf += probabilities[i];
-        if (coin < cdf) return i;
+        cdf += candidates[i].prob;
+        if (r < cdf) return candidates[i].index;
     }
-    return n - 1;
+    return candidates[n - 1].index;
 }
 
-static int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, float coin) {
-    int n0 = 0;
-    const float cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; ++i) {
-        if (probabilities[i] >= cutoff) {
-            probindex[n0].index = i;
-            probindex[n0].prob = probabilities[i];
-            n0++;
+static int collect_top_k_probabilities(
+    const float *probabilities,
+    int vocab_size,
+    int top_k,
+    ProbIndex *top_candidates
+) {
+    int limit = top_k;
+    int count = 0;
+    if (limit <= 0 || limit > vocab_size) limit = vocab_size;
+    for (int i = 0; i < vocab_size; ++i) {
+        float prob = probabilities[i];
+        int pos;
+        if (prob <= 0.0f) continue;
+        if (count == limit && prob <= top_candidates[count - 1].prob) continue;
+        pos = count;
+        if (count < limit) {
+            count++;
+        } else {
+            pos = count - 1;
         }
+        while (pos > 0 && top_candidates[pos - 1].prob < prob) {
+            if (pos < limit) top_candidates[pos] = top_candidates[pos - 1];
+            pos--;
+        }
+        top_candidates[pos].index = i;
+        top_candidates[pos].prob = prob;
     }
-    qsort(probindex, (size_t)n0, sizeof(ProbIndex), compare_prob_index);
+    return count;
+}
+
+static int truncate_top_p_candidates(ProbIndex *candidates, int count, float topp, float *kept_sum) {
     float cumulative_prob = 0.0f;
-    int last_idx = n0 - 1;
-    for (int i = 0; i < n0; ++i) {
-        cumulative_prob += probindex[i].prob;
+    int kept = count;
+    *kept_sum = 0.0f;
+    if (count <= 0) return 0;
+    if (topp <= 0.0f || topp >= 1.0f) {
+        for (int i = 0; i < count; ++i) *kept_sum += candidates[i].prob;
+        return count;
+    }
+    for (int i = 0; i < count; ++i) {
+        cumulative_prob += candidates[i].prob;
         if (cumulative_prob > topp) {
-            last_idx = i;
+            kept = i + 1;
             break;
         }
     }
-    float r = coin * cumulative_prob;
-    float cdf = 0.0f;
-    for (int i = 0; i <= last_idx; ++i) {
-        cdf += probindex[i].prob;
-        if (r < cdf) return probindex[i].index;
+    for (int i = 0; i < kept; ++i) {
+        *kept_sum += candidates[i].prob;
     }
-    return probindex[last_idx].index;
+    if (*kept_sum <= 0.0f) {
+        for (int i = 0; i < count; ++i) {
+            *kept_sum += candidates[i].prob;
+        }
+        return count;
+    }
+    return kept;
 }
 
-static void apply_top_k(float *logits, int vocab_size, int top_k) {
-    if (top_k <= 0 || top_k >= vocab_size) return;
-    for (int i = 0; i < vocab_size; ++i) {
-        int better = 0;
-        for (int j = 0; j < vocab_size; ++j) {
-            if (logits[j] > logits[i]) {
-                better++;
-                if (better >= top_k) {
-                    logits[i] = -1e30f;
-                    break;
-                }
-            }
-        }
+static void debug_dump_first_step_candidates(
+    const ProbIndex *top_k_candidates,
+    int top_k_count,
+    const ProbIndex *top_p_candidates,
+    int top_p_count,
+    float top_p_sum,
+    int sampled_token
+) {
+    fprintf(stderr, "[SAMPLER] first-step top_k count=%d top_p count=%d top_p_sum=%.6f sampled=%d\n",
+            top_k_count, top_p_count, top_p_sum, sampled_token);
+    fprintf(stderr, "[SAMPLER] top_k:");
+    for (int i = 0; i < top_k_count; ++i) {
+        fprintf(stderr, " (%d,%.6f)", top_k_candidates[i].index, top_k_candidates[i].prob);
     }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "[SAMPLER] top_p:");
+    for (int i = 0; i < top_p_count; ++i) {
+        fprintf(stderr, " (%d,%.6f)", top_p_candidates[i].index, top_p_candidates[i].prob);
+    }
+    fprintf(stderr, "\n");
 }
 
 static void apply_repetition_penalty(float *logits, int vocab_size, const int *history, int history_len, float penalty) {
+    unsigned char seen_once[512] = {0};
     if (penalty <= 1.0f) return;
     for (int h = 0; h < history_len; ++h) {
         int tok = history[h];
         if (tok < 0 || tok >= vocab_size) continue;
+        if (vocab_size <= (int)sizeof(seen_once)) {
+            if (seen_once[tok]) continue;
+            seen_once[tok] = 1;
+        } else {
+            int already_seen = 0;
+            for (int prev = 0; prev < h; ++prev) {
+                if (history[prev] == tok) {
+                    already_seen = 1;
+                    break;
+                }
+            }
+            if (already_seen) continue;
+        }
         if (logits[tok] < 0.0f) logits[tok] *= penalty;
         else logits[tok] /= penalty;
     }
@@ -524,6 +938,8 @@ void build_sampler(
     sampler->repetition_penalty = repetition_penalty;
     sampler->no_repeat_ngram_size = no_repeat_ngram_size;
     sampler->rng_state = rng_seed;
+    sampler->debug_dump_first_step = runtime_env_flag_enabled("RUNQ_DEBUG_FIRST_STEP");
+    sampler->sample_calls = 0;
     sampler->probindex = (ProbIndex *)malloc((size_t)vocab_size * sizeof(ProbIndex));
     if (!sampler->probindex) {
         fprintf(stderr, "build_sampler: probindex 分配失败\n");
@@ -537,19 +953,34 @@ void free_sampler(RuntimeSampler *sampler) {
 }
 
 int sample_token(RuntimeSampler *sampler, float *logits, const int *history, int history_len) {
+    ProbIndex *candidates = sampler->probindex;
+    int candidate_count = 0;
+    int kept_count = 0;
+    float kept_sum = 0.0f;
     int next = 0;
-    apply_repetition_penalty(logits, sampler->vocab_size, history, history_len, sampler->repetition_penalty);
-    apply_no_repeat_ngram(logits, sampler->vocab_size, history, history_len, sampler->no_repeat_ngram_size);
-    apply_top_k(logits, sampler->vocab_size, sampler->top_k);
     if (sampler->temperature == 0.0f) {
+        apply_repetition_penalty(logits, sampler->vocab_size, history, history_len, sampler->repetition_penalty);
+        apply_no_repeat_ngram(logits, sampler->vocab_size, history, history_len, sampler->no_repeat_ngram_size);
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
-        for (int q = 0; q < sampler->vocab_size; ++q) logits[q] /= sampler->temperature;
+        const float temperature = sampler->temperature > 1e-6f ? sampler->temperature : 1e-6f;
+        for (int q = 0; q < sampler->vocab_size; ++q) logits[q] /= temperature;
+        apply_repetition_penalty(logits, sampler->vocab_size, history, history_len, sampler->repetition_penalty);
+        apply_no_repeat_ngram(logits, sampler->vocab_size, history, history_len, sampler->no_repeat_ngram_size);
         softmax_ref(logits, sampler->vocab_size);
-        const float coin = random_f32(&sampler->rng_state);
-        if (sampler->topp <= 0 || sampler->topp >= 1) next = sample_mult(logits, sampler->vocab_size, coin);
-        else next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+        candidate_count = collect_top_k_probabilities(logits, sampler->vocab_size, sampler->top_k, candidates);
+        if (candidate_count <= 0) {
+            next = sample_argmax(logits, sampler->vocab_size);
+        } else {
+            const float coin = random_f32(&sampler->rng_state);
+            kept_count = truncate_top_p_candidates(candidates, candidate_count, sampler->topp, &kept_sum);
+            next = sample_mult_candidates(candidates, kept_count, kept_sum, coin);
+            if (sampler->debug_dump_first_step && sampler->sample_calls == 0) {
+                debug_dump_first_step_candidates(candidates, candidate_count, candidates, kept_count, kept_sum, next);
+            }
+        }
     }
+    sampler->sample_calls++;
     return next;
 }
 
@@ -608,35 +1039,37 @@ float *runtime_decode_transformer_step(RuntimeBackend *backend, int token, int p
     int kv_dim = (config->dim * config->n_kv_heads) / config->n_heads;
     int hidden_dim = config->hidden_dim;
     int head_size = dim / config->n_heads;
+    int kv_mul = config->n_heads / config->n_kv_heads;
 
     // 这条路径是部署/验证共用的“单 token decode 调度器”。
     // 关键点是：frontend 不再调用整图 forward，而是严格通过 backend 的算子级接口推进每一步。
     runtime_load_embedding_row(model, token, state->x);
+    runtime_refresh_kv_main_regions(state, config);
     for (int layer = 0; layer < config->n_layers; ++layer) {
-        int loff = layer * config->seq_len * kv_dim;
-        float *layer_key_cache = state->key_cache + loff;
-        float *layer_value_cache = state->value_cache + loff;
-        float *key_cache_row = layer_key_cache + pos * kv_dim;
-        float *value_cache_row = layer_value_cache + pos * kv_dim;
+        float *key_cache_row = runtime_key_cache_row_ptr(state, layer, pos, config->seq_len, kv_dim);
+        float *value_cache_row = runtime_value_cache_row_ptr(state, layer, pos, config->seq_len, kv_dim);
+        RuntimeKvCacheLayerView key_view;
+        RuntimeKvCacheLayerView value_view;
 
+        runtime_init_layer_kv_views(model, layer, &key_view, &value_view, 0);
         backend->ops->rmsnorm(backend, state->xb, state->x, weights->rms_att_weight + layer * dim, dim);
-        backend->ops->linear_qkv(backend, state->q, state->k, state->v, state->xb, layer);
+        runtime_linear_qkv_row(backend, state->q, key_cache_row, value_cache_row, state->xb, layer);
 
         // RoPE 和 KV cache 仍放在公共调度层：
         // 1. backend 只关心算子语义；
         // 2. 位置编码与 cache 组织属于跨算子的 runtime 责任。
-        apply_rope_inplace(state->q, state->k, dim, kv_dim, head_size, pos);
-        memcpy(key_cache_row, state->k, (size_t)kv_dim * sizeof(float));
-        memcpy(value_cache_row, state->v, (size_t)kv_dim * sizeof(float));
+        runtime_apply_rope_to_qk_row(state->q, key_cache_row, dim, kv_dim, head_size, pos);
+        runtime_commit_kv_rows(model, &key_view, &value_view, pos, key_cache_row, value_cache_row);
+        runtime_clear_transient_kv(state, kv_dim);
 
         // xb 在 attention 子图里作为“所有 head 拼接后的上下文向量”。
         memset(state->xb, 0, (size_t)dim * sizeof(float));
         for (int h = 0; h < config->n_heads; ++h) {
             float *att_head = state->att + h * config->seq_len;
             float *xb_head = state->xb + h * head_size;
-            backend->ops->qk_matmul(backend, att_head, state->q, layer_key_cache, pos, h);
+            backend->ops->qk_matmul(backend, att_head, state->q, runtime_key_view(&key_view), pos, h);
             backend->ops->softmax_row(backend, att_head, pos + 1);
-            backend->ops->av_matmul(backend, xb_head, att_head, layer_value_cache, pos, h);
+            backend->ops->av_matmul(backend, xb_head, att_head, runtime_value_view(&value_view), pos, h);
         }
 
         backend->ops->linear_attn_o(backend, state->xb2, state->xb, layer);

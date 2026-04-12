@@ -27,7 +27,7 @@ def write_xxd_style_header(input_path: Path, output_path: Path, symbol_name: str
             lines.append("\n")
     lines.append("};\n")
     lines.append(f"unsigned int {symbol_name}_len = {len(data)};\n")
-    output_path.write_text("".join(lines), encoding="ascii", newline="\n")
+    output_path.write_text("".join(lines), encoding="utf-8", newline="\n")
 
 
 def main() -> None:

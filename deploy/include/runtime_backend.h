@@ -7,6 +7,10 @@
 // - frontend / decode 调度器只负责决定执行顺序；
 // - backend 负责给出每个算子的具体实现；
 // - 这样 CPU 参考实现与 HW_STUB/未来真实硬件后端可以复用同一条 decode 主链。
+//
+// 当前阶段最重要的接口收敛是：
+// - qk_matmul / av_matmul 不再长期接受裸 float* 历史 KV；
+// - runtime 先把历史 KV 收口成 layer view，再由 backend 通过统一解释规则访问。
 typedef struct RuntimeBackendOps {
     const char *name;
     int (*init)(RuntimeBackend *backend, RuntimeModel *model);
@@ -17,9 +21,9 @@ typedef struct RuntimeBackendOps {
     void (*rmsnorm)(RuntimeBackend *backend, float *out, const float *x, const float *weight, int size);
     void (*linear_qkv)(RuntimeBackend *backend, float *q, float *k, float *v, const float *x, int layer_idx);
     void (*linear_attn_o)(RuntimeBackend *backend, float *out, const float *x, int layer_idx);
-    void (*qk_matmul)(RuntimeBackend *backend, float *att, const float *q, const float *key_cache, int pos, int head_idx);
+    void (*qk_matmul)(RuntimeBackend *backend, float *att, const float *q, const RuntimeKvCacheLayerView *key_view, int pos, int head_idx);
     void (*softmax_row)(RuntimeBackend *backend, float *row, int size);
-    void (*av_matmul)(RuntimeBackend *backend, float *out, const float *att, const float *value_cache, int pos, int head_idx);
+    void (*av_matmul)(RuntimeBackend *backend, float *out, const float *att, const RuntimeKvCacheLayerView *value_view, int pos, int head_idx);
     void (*linear_ffn_w1)(RuntimeBackend *backend, float *out, const float *x, int layer_idx);
     void (*linear_ffn_w3)(RuntimeBackend *backend, float *out, const float *x, int layer_idx);
     void (*gate_mul)(RuntimeBackend *backend, float *out, const float *w1_out, const float *w3_out, int size);

@@ -6,6 +6,24 @@
 #include "runtime_assets.h"
 #include "runtime_common.h"
 
+static int runtime_debug_prompt_tokens_enabled(void) {
+    const char *value = getenv("RUNQ_DEBUG_PROMPT_TOKENS");
+    if (!value || !value[0]) return 0;
+    if (strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0) return 0;
+    if (strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0) return 0;
+    return 1;
+}
+
+static void runtime_debug_dump_tokens(const char *label, const int *tokens, int count) {
+    if (!runtime_debug_prompt_tokens_enabled()) return;
+    fprintf(stderr, "[TOKENS] %s count=%d:", label, count);
+    for (int i = 0; i < count; ++i) {
+        fprintf(stderr, " %d", tokens[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
 static int append_history_token(int *history_tokens, int history_capacity, int *history_len, int token, const char *tag) {
     // 这里记录“已经真正送入模型执行图”的 token 历史。
     // 采样器的 repetition penalty / no-repeat-ngram 应该基于真实上下文，而不是基于尚未执行的未来 token。
@@ -81,6 +99,7 @@ static int prepare_chat_turn(
         fprintf(stderr, "runtime_run_chat: 当前轮 chat prompt 编码后 token 数为 0\n");
         return -1;
     }
+    runtime_debug_dump_tokens("chat_prompt", prompt_tokens, *num_prompt_tokens);
     if (*num_prompt_tokens > (steps - pos)) {
         fprintf(stderr, "runtime_run_chat: 剩余上下文不足，当前轮 prompt 需要 %d 个 token，剩余仅 %d\n",
                 *num_prompt_tokens, steps - pos);
@@ -169,6 +188,7 @@ int runtime_run_generate(RuntimeApp *app, char *prompt, int steps) {
         free(history_tokens);
         return 0;
     }
+    runtime_debug_dump_tokens("generate_prompt", history_tokens, num_prompt_tokens);
 
     // 每次生成前显式清空 backend 内部状态，避免上一次对话污染 KV cache。
     backend->ops->reset(backend);

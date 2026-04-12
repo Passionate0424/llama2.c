@@ -20,11 +20,12 @@ typedef struct {
     const SharedBufferDesc *out;
     const SharedBufferDesc *param;
     // queue-shadow：
-    // - 第一版先在软件侧把 DMA 级 entry 组包并落到 CMDQ backing storage；
-    // - 默认执行语义仍走 legacy submit，不在这里切默认 queue mode。
+    // - 第一版先在软件侧把 primitive entry 组包并落到 CMDQ backing storage；
+    // - 默认执行语义仍走 legacy submit，但观测语义改为 seq_id + trace_tag。
     uint32_t cmdq_shadow_offset;
     uint32_t cmdq_shadow_count;
-    uint32_t submit_job_id;
+    uint32_t seq_id;
+    uint32_t trace_tag;
 } RuntimeHwLinearJob;
 
 typedef struct {
@@ -86,11 +87,12 @@ typedef struct {
     uint16_t line_stride;
 
     // word4:
-    // job_id 先由软件分配，completion 回写时用同一值对应。
-    uint32_t job_id;
+    // seq_id 是 completion 唯一身份标识。
+    uint32_t seq_id;
 
     // word5~7:
-    // 先保留给后续扩展，例如 src/dst bank、profiling tag、doorbell class 等。
+    // user0 当前先承载 trace_tag，仍属于软件观测字段；
+    // 其余字段先保留给后续扩展，例如 src/dst bank、doorbell class 等。
     uint32_t user0;
     uint32_t reserved2;
     uint32_t reserved3;
@@ -98,11 +100,11 @@ typedef struct {
 
 typedef struct {
     // 最小 completion 合同：
-    // - 回报 job_id
+    // - 只回报 seq_id
     // - 回报状态
     // - 回报错误码
     // - 回报粗粒度 cycle 计数
-    uint32_t job_id;
+    uint32_t seq_id;
     uint16_t status;
     uint16_t error_code;
     uint32_t cycles;
@@ -127,7 +129,8 @@ void runtime_hw_soft_reset(void);
 int runtime_hw_init_cmd_entry(
     RuntimeHwCmdEntry *entry,
     RuntimeHwCmdOpcode opcode,
-    uint32_t job_id,
+    uint32_t seq_id,
+    uint32_t trace_tag,
     uint32_t addr,
     uint16_t len_bytes,
     uint8_t qos_class,
@@ -137,7 +140,7 @@ int runtime_hw_init_cmd_entry(
 );
 int runtime_hw_init_cmp_entry(
     RuntimeHwCmpEntry *entry,
-    uint32_t job_id,
+    uint32_t seq_id,
     RuntimeHwCmpStatus status,
     uint16_t error_code,
     uint32_t cycles,
@@ -151,10 +154,19 @@ const SharedBufferDesc *runtime_hw_adapter_shared_in(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_out(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_param(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_kv(void);
+const SharedBufferDesc *runtime_hw_adapter_key_cache_main_data(void);
+const SharedBufferDesc *runtime_hw_adapter_key_cache_main_scale(void);
+const SharedBufferDesc *runtime_hw_adapter_value_cache_main_data(void);
+const SharedBufferDesc *runtime_hw_adapter_value_cache_main_scale(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_scratch(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_trace(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_cmdq(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_cmpq(void);
 const SharedBufferDesc *runtime_hw_adapter_shared_dbg2(void);
+uint32_t runtime_hw_adapter_cmdq_head(void);
+uint32_t runtime_hw_adapter_cmdq_tail(void);
+uint32_t runtime_hw_adapter_cmpq_head(void);
+uint32_t runtime_hw_adapter_cmpq_tail(void);
+int runtime_hw_adapter_queue_shadow_is_empty(void);
 
 #endif

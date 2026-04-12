@@ -1,0 +1,2 @@
+gcc -Ofast -D_WIN32 -o run.exe -I. run.c win.c
+gcc -Ofast -D_WIN32 -o runq.exe -I. runq.c win.c

@@ -24,6 +24,37 @@ typedef struct {
     float *s;
 } QuantizedTensor;
 
+// 共享缓冲必须显式区分 CPU 访问地址和给 DMA/MMIO 编程用的物理地址。
+typedef struct {
+    // CPU 实际可解引用的指针。
+    // 在 intel_host_stub / HW_STUB 环境下通常指向本地静态数组；
+    // 在 SoC 环境下可替换成 uncached alias 对应的虚拟地址映射。
+    void *cpu_ptr;
+    // CPU 使用的 uncached alias 地址口径（用于日志、寄存器编程参数准备）。
+    uintptr_t cpu_uncached_addr;
+    // DMA / MMIO 编程使用的物理总线地址口径。
+    uint32_t phys_addr;
+    size_t size;
+} SharedBufferDesc;
+
+// KV 访问视图：
+// 1) 先把 backend 对历史 KV 的正式输入从裸 float* 收口成 view；
+// 2) 当前阶段仍允许用 legacy_float_data 绑定旧的 float backing，便于逐步迁移；
+// 3) 后续切到 KV_MAIN int8 data + scale metadata 时，优先替换 view 的解释逻辑，
+//    而不是再次修改 backend 算子签名。
+typedef struct {
+    const SharedBufferDesc *data_region;
+    const SharedBufferDesc *scale_region;
+    // 迁移期保留的 float backing，仅供 SW_REF/HW_STUB 与旧验证路径复用。
+    float *legacy_float_data;
+    int seq_len;
+    int kv_dim;
+    int head_size;
+    int kv_mul;
+    size_t data_stride_bytes;
+    size_t scale_stride_bytes;
+} RuntimeKvCacheLayerView;
+
 typedef struct {
     // token embedding，当前按整张 q80 表原位映射。
     QuantizedTensor *q_tokens;
@@ -53,17 +84,25 @@ typedef struct {
     // xq / hq 是激活侧量化后的临时视图，不拥有独立生命周期。
     QuantizedTensor xq;
     QuantizedTensor hq;
-    // 当前 token 的 q/k/v 向量。
+    // 当前 token 的 q 向量。
     float *q;
+    // 当前阶段仍暂存局部 k/v 中间结果；
+    // 后续 decode 主路径会逐步收敛为直接写入最终槽位，不再依赖这两个字段作为正式接口。
     float *k;
     float *v;
     // attention 缓冲按 [head][time] 组织。
     float *att;
     // 最终 lm_head 输出的 logits。
     float *logits;
-    // 按 [layer][time][kv_dim] 组织的 KV cache。
+    // 完整历史 KV 的旧 float backing。
+    // 当前只允许作为迁移期内部存储，不允许继续作为 backend/verify 的正式裸指针合同。
     float *key_cache;
     float *value_cache;
+    // KV_MAIN 一级窗口下的二级子区描述对象。
+    SharedBufferDesc key_cache_main_data_region;
+    SharedBufferDesc key_cache_main_scale_region;
+    SharedBufferDesc value_cache_main_data_region;
+    SharedBufferDesc value_cache_main_scale_region;
 } RuntimeState;
 
 typedef struct {
@@ -82,19 +121,6 @@ typedef struct {
     size_t size;
     size_t used;
 } RuntimeArena;
-
-// 共享缓冲必须显式区分 CPU 访问地址和给 DMA/MMIO 编程用的物理地址。
-typedef struct {
-    // CPU 实际可解引用的指针。
-    // 在 host / HW_STUB 环境下通常指向本地静态数组；
-    // 在 SoC 环境下可替换成 uncached alias 对应的虚拟地址映射。
-    void *cpu_ptr;
-    // CPU 使用的 uncached alias 地址口径（用于日志、寄存器编程参数准备）。
-    uintptr_t cpu_uncached_addr;
-    // DMA / MMIO 编程使用的物理总线地址口径。
-    uint32_t phys_addr;
-    size_t size;
-} SharedBufferDesc;
 
 typedef struct {
     char *str;
@@ -124,6 +150,8 @@ typedef struct {
     float repetition_penalty;
     int no_repeat_ngram_size;
     unsigned long long rng_state;
+    int debug_dump_first_step;
+    int sample_calls;
 } RuntimeSampler;
 
 typedef enum {

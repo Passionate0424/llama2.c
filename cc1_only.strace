@@ -1,0 +1,22 @@
+--- Process 97932 created
+--- Process 97932 loaded C:\Windows\System32\ntdll.dll at 00007ffaa0e80000
+--- Process 97932 loaded C:\Windows\System32\kernel32.dll at 00007ffa9f820000
+--- Process 97932 loaded C:\Windows\System32\KernelBase.dll at 00007ffa9da10000
+--- Process 97932 loaded C:\Windows\System32\apphelp.dll at 00007ffa99030000
+--- Process 97932 thread 85196 created
+--- Process 97932 loaded C:\Windows\System32\msvcrt.dll at 00007ffa9fd50000
+--- Process 97932 thread 71308 created
+--- Process 97932 thread 110748 created
+--- Process 97932 loaded E:\msys64\mingw64\bin\libmpc-3.dll at 00007ffa42500000
+--- Process 97932 loaded E:\msys64\mingw64\bin\libisl-23.dll at 00007ff9bba80000
+--- Process 97932 loaded D:\Git\mingw64\bin\libgcc_s_seh-1.dll at 00007ffa42e80000
+--- Process 97932 loaded D:\Git\mingw64\bin\libgmp-10.dll at 00007ffa421d0000
+--- Process 97932 loaded E:\msys64\mingw64\bin\libmpfr-6.dll at 00007ffa2ec70000
+--- Process 97932 loaded D:\Git\mingw64\bin\libwinpthread-1.dll at 00007ffa94e40000
+--- Process 97932 loaded D:\Git\mingw64\bin\zlib1.dll at 00007ffa42480000
+--- Process 97932 loaded D:\Git\mingw64\libexec\git-core\libzstd.dll at 00007ff9a3d10000
+--- Process 97932, exception c0000139 at 00007ffaa0e8dd3f
+--- Process 97932 thread 97576 exited with status 0xc0000139
+--- Process 97932 thread 85196 exited with status 0xc0000139
+--- Process 97932 thread 110748 exited with status 0xc0000139
+--- Process 97932 exited with status 0xc0000139

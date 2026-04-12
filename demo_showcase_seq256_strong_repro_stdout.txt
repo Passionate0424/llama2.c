@@ -1,0 +1,59 @@
+{
+  "checkpoint": "artifacts/qat_exec_graph_train_task_260k_finalpolishstrong_seq256_demo_final_polish_strong.pt",
+  "preset": "enhanced",
+  "prompt_set": "best",
+  "max_new_tokens": 140,
+  "decode": {
+    "temperature": 0.93,
+    "top_p": 0.9,
+    "top_k": 40,
+    "repetition_penalty": 1.05,
+    "no_repeat_ngram_size": 3
+  },
+  "results": [
+    {
+      "prompt": "Once upon a time",
+      "text": "Once upon a time, there was a little girl named Lily. She loved to play with her friends. One day, she saw a prainful squace. \nSue and the doll looked back, Jax came into the wind and said, \"Ohat is seale? I'm a drable?\" They walked home. He saw the box and said. \"Wow! Tom could join, Mia, and Spot. The man said,",
+      "distinct1": 0.6344827586206897,
+      "distinct2": 0.9791666666666666,
+      "distinct3": 1.0,
+      "max_repeat_run": 1,
+      "repeat_bigram_ratio": 0.02083333333333337,
+      "repeat_trigram_ratio": 0.0,
+      "tail_loop_ratio": 0.0
+    },
+    {
+      "prompt": "Ben opened the box and",
+      "text": "Ben opened the box and a color named Tom. He loved to play with his hote with his build in the world. He was very sad and said, \"I like you. What's be nice?\" Tom and said \"It was a little girl is things! Sue wanted to take something why didn't sure it on. You have me every day. The new friends talked up to the dad and flew their hand. But",
+      "distinct1": 0.6381578947368421,
+      "distinct2": 0.9536423841059603,
+      "distinct3": 1.0,
+      "max_repeat_run": 1,
+      "repeat_bigram_ratio": 0.04635761589403975,
+      "repeat_trigram_ratio": 0.0,
+      "tail_loop_ratio": 0.0
+    },
+    {
+      "prompt": "Tom was happy because",
+      "text": "Tom was happy because he had a shiny, the little boy named Tim was so diste of decided to play with his face.\nThe box saw a big family and started to high that he was very excited to climb. \nSuddenly, he was a ball joy. He shouted him and said, \"He could help you, leaves!\"\nWhen Timmy kept its mom took him to keep",
+      "distinct1": 0.5733333333333334,
+      "distinct2": 0.9395973154362416,
+      "distinct3": 1.0,
+      "max_repeat_run": 2,
+      "repeat_bigram_ratio": 0.06040268456375841,
+      "repeat_trigram_ratio": 0.0,
+      "tail_loop_ratio": 0.0
+    },
+    {
+      "prompt": "Timmy went to the park and found",
+      "text": "Timmy went to the park and found a vide. They all all playing together with it too milking and ate some. The little girl would asked her mom and said, \"What's give you be careful.\"\nAfter her mommy did not know this hands. The rabbit was sorry and knew a long. Lily was very happy and said. She says all showed the bird and put it up for the big ran",
+      "distinct1": 0.6339869281045751,
+      "distinct2": 0.9539473684210527,
+      "distinct3": 1.0,
+      "max_repeat_run": 2,
+      "repeat_bigram_ratio": 0.046052631578947345,
+      "repeat_trigram_ratio": 0.0,
+      "tail_loop_ratio": 0.0
+    }
+  ]
+}

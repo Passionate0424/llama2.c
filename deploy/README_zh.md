@@ -98,12 +98,19 @@
 - `.accel_cmpq`
 - `.accel_dbg2`
 
-以及共享区子区域：
+以及共享区/主数据面子区域：
+
+- `KV_MAIN_WINDOW`
+- `KEY_CACHE_MAIN_REGION`
+- `VALUE_CACHE_MAIN_REGION`
 
 - `ACCEL_IO_IN`
 - `ACCEL_IO_OUT`
 - `ACCEL_PARAM`
-- `ACCEL_KV_SHARED`
+- `KEY_CACHE_MAIN_DATA`
+- `KEY_CACHE_MAIN_SCALE`
+- `VALUE_CACHE_MAIN_DATA`
+- `VALUE_CACHE_MAIN_SCALE`
 - `ACCEL_SCRATCH`
 - `ACCEL_TRACE`
 
@@ -137,7 +144,8 @@
   - 大小：`32B`
   - 当前软件/RTL 对齐字段：
     - `opcode`
-    - `job_id`
+    - `seq_id`
+    - `trace_tag`
     - `addr`
     - `len_bytes`
     - `qos_class`
@@ -147,7 +155,7 @@
 - `CMPQ entry`
   - 大小：`16B`
   - 当前最小字段：
-    - `job_id`
+    - `seq_id`
     - `status`
     - `error_code`
     - `cycles`

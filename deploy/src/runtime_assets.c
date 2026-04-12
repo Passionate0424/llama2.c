@@ -5,10 +5,10 @@
 
 #include "runtime_common.h"
 
-// 第一版默认资产直接放在 deploy/assets/stories260K_qat_best 下。
-// 后续切模型时，只需切换目录 tag，不改运行时代码。
-#include "../assets/stories260K_qat_best/stories_data.h"
-#include "../assets/stories260K_qat_best/tok512.h"
+// 当前临时切到 seq256 strong 主展示 checkpoint 导出的资产，
+// 用于对齐 Python 展示链并和现有 deploy 结果做对比。
+#include "../assets/qat_best_compare_finalpolishstrong_seq256/stories_data.h"
+#include "../assets/qat_best_compare_finalpolishstrong_seq256/tok512.h"
 
 static void read_embedded_bytes(
     const unsigned char **cursor,

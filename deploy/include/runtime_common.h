@@ -64,11 +64,70 @@ int sample_token(RuntimeSampler *sampler, float *logits, const int *history, int
 
 void read_stdin_line(const char *guide, char *buffer, size_t bufsize);
 
-// 对当前 token 的 q/k 向量原地施加 RoPE 位置编码。
+// 对当前 token 的 q/k 行原地施加 RoPE 位置编码。
 void apply_rope_inplace(float *q, float *k, int dim, int kv_dim, int head_size, int pos);
+void runtime_apply_rope_to_qk_row(float *q, float *k_row, int dim, int kv_dim, int head_size, int pos);
 
 // 从 q80 embedding 表中按 token 解出一行到 float 缓冲。
 void runtime_load_embedding_row(const RuntimeModel *model, int token, float *out);
+
+// 统一把某一层的历史 KV 暴露成 layer view，避免 backend 继续吃裸 float* 历史 KV。
+void runtime_init_kv_cache_layer_view(
+    RuntimeKvCacheLayerView *view,
+    const SharedBufferDesc *data_region,
+    const SharedBufferDesc *scale_region,
+    float *legacy_float_data,
+    int seq_len,
+    int kv_dim,
+    int head_size,
+    int kv_mul,
+    size_t data_stride_bytes,
+    size_t scale_stride_bytes
+);
+
+// 统一计算某层某时刻的 KV data byte offset，并按 view 解释数据。
+size_t runtime_kv_cache_row_data_offset(const RuntimeKvCacheLayerView *view, int time_idx);
+const float *runtime_kv_cache_head_ptr(const RuntimeKvCacheLayerView *view, int time_idx, int head_idx);
+void runtime_kv_cache_extract_row(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row);
+void runtime_kv_cache_write_row(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row);
+void runtime_kv_cache_write_row_int8(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row);
+void runtime_kv_cache_read_row_int8(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row);
+int runtime_kv_cache_uses_int8_data(const RuntimeKvCacheLayerView *view);
+
+// 控制运行时是否优先走最小 int8 data 路径；默认关闭，仅作为实验开关。
+void runtime_set_kv_int8_mode(int enabled);
+int runtime_get_kv_int8_mode(void);
+
+// 刷新 RuntimeState 中 KV_MAIN data/scale region 的地址口径。
+void runtime_refresh_kv_main_regions(RuntimeState *state, const RuntimeConfig *config);
+void runtime_seed_kv_main_regions(RuntimeState *state, const RuntimeConfig *config, int kv_dim);
+int runtime_kv_has_legacy_float_backing(const RuntimeState *state);
+
+// 生成 key/value row 时统一计算本层 float backing 起点。
+float *runtime_key_cache_layer_ptr(RuntimeState *state, int layer_idx, int seq_len, int kv_dim);
+float *runtime_value_cache_layer_ptr(RuntimeState *state, int layer_idx, int seq_len, int kv_dim);
+float *runtime_key_cache_row_ptr(RuntimeState *state, int layer_idx, int pos, int seq_len, int kv_dim);
+float *runtime_value_cache_row_ptr(RuntimeState *state, int layer_idx, int pos, int seq_len, int kv_dim);
+
+// 当前阶段把 q/k/v 中间结果直接收口到 row 级 buffer。
+void runtime_linear_qkv_row(RuntimeBackend *backend, float *q, float *k_row, float *v_row, const float *x, int layer_idx);
+void runtime_clear_transient_kv(RuntimeState *state, int kv_dim);
+void runtime_init_layer_kv_views(
+    RuntimeModel *model,
+    int layer_idx,
+    RuntimeKvCacheLayerView *key_view,
+    RuntimeKvCacheLayerView *value_view,
+    int bind_hw_regions
+);
+void runtime_commit_kv_rows(
+    RuntimeModel *model,
+    RuntimeKvCacheLayerView *key_view,
+    RuntimeKvCacheLayerView *value_view,
+    int pos,
+    const float *key_row,
+    const float *value_row
+);
+void runtime_trace_kv_row(FILE *fp, const char *label, const RuntimeKvCacheLayerView *view, int time_idx);
 
 // 部署/验证共用的单 token decode 调度器，返回 state->logits。
 float *runtime_decode_transformer_step(RuntimeBackend *backend, int token, int pos);
