@@ -50,6 +50,8 @@ static void hwstub_destroy(RuntimeBackend *backend) {
 
 static void hwstub_rmsnorm(RuntimeBackend *backend, float *out, const float *x, const float *weight, int size) {
     stub_trace(backend, "rmsnorm");
+    // HW_STUB 阶段先保持独立 float 算子执行，
+    // 但 trace 口径已经可作为 RMSNorm Fusion Preview 的观测入口。
     rmsnorm_ref(out, x, weight, size);
 }
 
@@ -57,16 +59,8 @@ static void hwstub_linear_qkv(RuntimeBackend *backend, float *q, float *k, float
     RuntimeState *state = &backend->model->state;
     int dim = backend->model->config.dim;
     int kv_dim = (backend->model->config.dim * backend->model->config.n_kv_heads) / backend->model->config.n_heads;
-    RuntimeHwLinearJob linear_job;
     stub_trace(backend, "linear_qkv");
     runtime_hw_adapter_trace_op("linear_qkv", layer_idx, dim);
-    // HW_STUB 当前分两段执行：
-    // 1. 先走 adapter/job 提交边界，验证硬件调用顺序；
-    // 2. 再落回软件 q80 matmul，保证结果仍可与 SW_REF 逐项比较。
-    if (runtime_hw_prepare_linear_job(&linear_job, "linear_qkv", layer_idx, (size_t)dim) == 0) {
-        (void)runtime_hw_submit_job("linear", &linear_job);
-        (void)runtime_hw_wait_done(0u);
-    }
     memcpy(state->xb, x, (size_t)dim * sizeof(float));
     quantize_tensor(&state->xq, state->xb, dim, hwstub_group_size(backend));
     matmul_ref(q, &state->xq, backend->model->weights.wq + layer_idx, dim, dim, hwstub_group_size(backend));
@@ -102,6 +96,8 @@ static void hwstub_qk_matmul(RuntimeBackend *backend, float *att, const float *q
 static void hwstub_softmax_row(RuntimeBackend *backend, float *row, int size) {
     stub_trace(backend, "softmax_row");
     runtime_hw_adapter_trace_op("softmax_row", 0, size);
+    // HW_STUB 阶段先保持独立 float 算子执行，
+    // 但 trace 口径已经可作为 Softmax Fusion Preview 的观测入口。
     softmax_ref(row, size);
 }
 

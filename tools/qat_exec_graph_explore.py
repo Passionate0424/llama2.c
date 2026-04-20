@@ -76,6 +76,79 @@ def qdq_mid16_token_ste(x: torch.Tensor) -> torch.Tensor:
     return q * scale
 
 
+def qdq_mid16_layer_ste(x: torch.Tensor) -> torch.Tensor:
+    x = x.float()
+    scale = x.abs().max().clamp(min=1e-8) / 32767.0
+    q = torch.clamp(ste_round(x / scale), -32767, 32767)
+    return q * scale
+
+
+def qdq_kv_tensor_ste(x: torch.Tensor, mode: str, group_size: int = 64) -> torch.Tensor:
+    x = x.float()
+    if mode == "none":
+        return x
+    if mode == "per_kv_head":
+        # 每个 kv head 单独一份 scale，对应 deploy 里按 head 组织 metadata 的候选方案。
+        return qdq_lastdim_ste(x, mode="dynamic_token")
+    flat = x.reshape(*x.shape[:-2], -1)
+    if mode == "per_row":
+        flat = qdq_lastdim_ste(flat, mode="dynamic_token")
+        return flat.reshape_as(x)
+    if mode == "group64":
+        parts = []
+        for start in range(0, flat.shape[-1], group_size):
+            chunk = flat[..., start : start + group_size]
+            parts.append(qdq_lastdim_ste(chunk, mode="dynamic_token"))
+        return torch.cat(parts, dim=-1).reshape_as(x)
+    raise ValueError(mode)
+
+
+def qdq_qk_scores_ste(scores: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == "none":
+        return scores
+    if mode == "mid16_token":
+        return qdq_mid16_token_ste(scores)
+    if mode == "mid16_layer":
+        return qdq_mid16_layer_ste(scores)
+    raise ValueError(mode)
+
+
+def make_attention_forward_train_cfg(module: Attention, cfg):
+    def forward(self, x, freqs_cos, freqs_sin):
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+        xk = qdq_kv_tensor_ste(xk, cfg.kv_cache_mode, group_size=cfg.attn_group_size)
+        xv = qdq_kv_tensor_ste(xv, cfg.kv_cache_mode, group_size=cfg.attn_group_size)
+        xk = repeat_kv(xk, self.n_rep)
+        xv = repeat_kv(xv, self.n_rep)
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+        scores = torch.matmul(xq, xk.transpose(2, 3)) / (self.head_dim ** 0.5)
+        causal_mask = torch.triu(torch.ones((seqlen, seqlen), device=scores.device, dtype=torch.bool), diagonal=1)
+        finite_scores = scores.masked_fill(causal_mask.view(1, 1, seqlen, seqlen), 0.0)
+        finite_scores = qdq_qk_scores_ste(finite_scores, cfg.qk_score_mode)
+        scores = finite_scores.masked_fill(causal_mask.view(1, 1, seqlen, seqlen), -1.0e4)
+        if cfg.use_approx_softmax == "rough":
+            probs = approx_softmax_scores_train(scores.float())
+        elif cfg.use_approx_softmax == "improved":
+            probs = approx_softmax_scores_train_improved(scores.float())
+        else:
+            probs = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(probs, xv)
+        output = qdq_kv_tensor_ste(output, cfg.av_out_mode, group_size=cfg.attn_group_size)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
+
+    return MethodType(forward, module)
+
+
 class QATLinear(nn.Module):
     def __init__(
         self,
@@ -230,6 +303,10 @@ class ExecGraphQATConfig:
     linear_weight_mode: str = "per_row"
     use_acc32: bool = True
     use_mid16: bool = True
+    kv_cache_mode: str = "none"
+    qk_score_mode: str = "none"
+    av_out_mode: str = "none"
+    attn_group_size: int = 64
 
 
 def prepare_qat_model(model: nn.Module, linear_scales, rms_scales, cfg: ExecGraphQATConfig) -> nn.Module:
@@ -262,11 +339,12 @@ def prepare_qat_model(model: nn.Module, linear_scales, rms_scales, cfg: ExecGrap
                     raise ValueError(cfg.norm_impl)
                 replace_module(model, name, repl)
 
-    if cfg.use_approx_softmax != "none":
+    if cfg.use_approx_softmax != "none" or cfg.kv_cache_mode != "none" or cfg.qk_score_mode != "none" or cfg.av_out_mode != "none":
         for module in model.modules():
             if isinstance(module, Attention):
-                # Attention 内部只替换 softmax 数学，QKV/O 线性层仍走上面的 QATLinear。
-                module.forward = make_attention_forward_train(module, use_approx_softmax=cfg.softmax_impl)
+                # Attention 内部允许独立注入 KV/QK/AV 量化代理；
+                # 若 softmax 保持 none，则仍走真实 softmax，只隔离本轮关注的误差源。
+                module.forward = make_attention_forward_train_cfg(module, cfg)
     return model
 
 
@@ -482,11 +560,11 @@ def main():
 
     configs = {
         # 先只验证 GEMM 主数据通路和 MID16 中间域能否被训练适配。
-        "exec_graph_linear_mid16": ExecGraphQATConfig(use_approx_norm=False, use_approx_softmax=False),
+        "exec_graph_linear_mid16": ExecGraphQATConfig(use_approx_norm=False, use_approx_softmax="none"),
         # 再把当前 RMSNorm 近似拉进图里，观察 QAT 是否还能稳住。
-        "exec_graph_norm": ExecGraphQATConfig(use_approx_softmax=False),
+        "exec_graph_norm": ExecGraphQATConfig(use_approx_softmax="none"),
         # 最后再把 row-softmax 也拉进来，验证完整执行图训练可达性。
-        "exec_graph_full": ExecGraphQATConfig(use_approx_softmax=True),
+        "exec_graph_full": ExecGraphQATConfig(use_approx_softmax="rough"),
     }
 
     results = {

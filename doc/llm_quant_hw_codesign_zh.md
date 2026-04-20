@@ -304,6 +304,16 @@ V1 建议下放硬件：
 
 当前结论如下：
 
+> 口径说明：本节主要记录量化/硬件协同设计上的**方案建议与训练先验**，不等于 `deploy/` 当前已冻结实现。
+> 当前 deploy V1 的真实默认执行主线仍是：`quantized linears + float attention core`。
+> 其中 `rmsnorm / softmax_row` 可以因为 RTL 已有通路而被视为 Fusion Preview 候选，但不能据此推导出 deploy 默认路径已经切到 fused/hardware 执行。
+
+> 当前默认对齐的 deploy QAT best 资产口径是：`deploy/assets/qat_best_compare_finalpolishstrong_seq256/`；
+> `stories260K_qat_best/` 应视为官方导出基线，而不是本轮状态记录中的默认 QAT best。
+
+> 因此，文中提到的 `ACC32_RAW / MID16 / RMSNorm / SOFTMAX_ROW` 路线，应理解为“后续硬件化/融合设计的候选空间”，而不是当前 deploy 已完成冻结的执行数学。
+
+
 ### 1. `LINEAR + ACC32_RAW + MID16` 是可训练的
 
 在 GPU 上，`linear_only` 路线用更长训练后：

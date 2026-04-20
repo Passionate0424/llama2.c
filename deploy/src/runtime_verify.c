@@ -116,6 +116,42 @@ int runtime_run_verify_suite(void) {
         print_metric(&metric, tol);
         fail_count += update_case_result(&metric, &total_cases);
     }
+    {
+        VerifyMetric metric = compare_tensor("linear_qkv_k", state->k, tmp_d, kv_dim, tol);
+        print_metric(&metric, tol);
+        fail_count += update_case_result(&metric, &total_cases);
+    }
+    {
+        VerifyMetric metric = compare_tensor("linear_qkv_v", state->v, tmp_a, kv_dim, tol);
+        print_metric(&metric, tol);
+        fail_count += update_case_result(&metric, &total_cases);
+    }
+
+    memset(state->value_cache, 0, (size_t)model.config.seq_len * (size_t)kv_dim * sizeof(float));
+    for (int t = 0; t < 4; ++t) {
+        for (int i = 0; i < kv_dim; ++i) {
+            state->value_cache[t * kv_dim + i] = cosf((float)(t * kv_dim + i) * 0.07f);
+        }
+    }
+    tmp_b[0] = 0.4f; tmp_b[1] = 0.3f; tmp_b[2] = 0.2f; tmp_b[3] = 0.1f;
+    {
+        RuntimeKvCacheLayerView value_view;
+        runtime_init_kv_cache_layer_view(
+            &value_view,
+            &state->value_cache_main_data_region,
+            model.config.seq_len,
+            kv_dim,
+            head_size,
+            model.config.n_heads / model.config.n_kv_heads,
+            (size_t)kv_dim * sizeof(float));
+        swref.ops->av_matmul(&swref, tmp_c, tmp_b, &value_view, 3, 3);
+        hwstub.ops->av_matmul(&hwstub, tmp_d, tmp_b, &value_view, 3, 3);
+    }
+    {
+        VerifyMetric metric = compare_tensor("av_matmul", tmp_c, tmp_d, head_size, tol);
+        print_metric(&metric, tol);
+        fail_count += update_case_result(&metric, &total_cases);
+    }
 
     // qk_matmul 不再只测 pos=0/head=0。
     // 这里显式构造 4 个历史 token 和一个非零 head，确保：
@@ -135,42 +171,14 @@ int runtime_run_verify_suite(void) {
         runtime_init_kv_cache_layer_view(
             &key_view,
             &state->key_cache_main_data_region,
-            &state->key_cache_main_scale_region,
-            state->key_cache,
             model.config.seq_len,
             kv_dim,
             head_size,
             model.config.n_heads / model.config.n_kv_heads,
-            (size_t)kv_dim * sizeof(float),
-            sizeof(float));
+            (size_t)kv_dim * sizeof(float));
         swref.ops->qk_matmul(&swref, tmp_b, state->q, &key_view, 3, 3);
         hwstub.ops->qk_matmul(&hwstub, tmp_c, state->q, &key_view, 3, 3);
     }
-    {
-        RuntimeKvCacheLayerView key_view;
-        float row_buf[RUNTIME_MODEL_MAX_DIM];
-        runtime_set_kv_int8_mode(1);
-        runtime_init_kv_cache_layer_view(
-            &key_view,
-            runtime_hw_adapter_key_cache_main_data(),
-            runtime_hw_adapter_key_cache_main_scale(),
-            state->key_cache,
-            model.config.seq_len,
-            kv_dim,
-            head_size,
-            model.config.n_heads / model.config.n_kv_heads,
-            (size_t)kv_dim * sizeof(int8_t),
-            sizeof(float));
-        runtime_kv_cache_write_row_int8(&key_view, 0, state->key_cache);
-        runtime_kv_cache_extract_row(&key_view, 0, row_buf);
-        runtime_set_kv_int8_mode(0);
-        {
-            VerifyMetric metric = compare_tensor("kv_int8_row", state->key_cache, row_buf, kv_dim, 0.25f);
-            print_metric(&metric, 0.25f);
-            fail_count += update_case_result(&metric, &total_cases);
-        }
-    }
-    runtime_set_kv_int8_mode(0);
     {
         VerifyMetric metric = compare_tensor("qk_matmul", tmp_b, tmp_c, 4, tol);
         print_metric(&metric, tol);
@@ -227,23 +235,6 @@ int runtime_run_verify_suite(void) {
     hwstub.ops->residual_add(&hwstub, tmp_a, tmp_c, dim);
     {
         VerifyMetric metric = compare_tensor("residual_add", tmp_d, tmp_a, dim, tol);
-        print_metric(&metric, tol);
-        fail_count += update_case_result(&metric, &total_cases);
-    }
-    {
-        VerifyMetric metric;
-        metric.label = "queue_shadow";
-        metric.elem_count = 4;
-        metric.max_abs_err = 0.0f;
-        metric.mean_abs_err = 0.0f;
-        metric.mismatch_count = 0;
-        if (!runtime_hw_queue_layout_is_valid() || !runtime_hw_adapter_queue_shadow_is_empty() ||
-            runtime_hw_adapter_cmdq_head() != runtime_hw_adapter_cmdq_tail() ||
-            runtime_hw_adapter_cmpq_head() != runtime_hw_adapter_cmpq_tail()) {
-            metric.mismatch_count = 1;
-            metric.max_abs_err = 1.0f;
-            metric.mean_abs_err = 1.0f;
-        }
         print_metric(&metric, tol);
         fail_count += update_case_result(&metric, &total_cases);
     }

@@ -73,7 +73,7 @@
 
 因此，当前 `runq_deploy_hw` 是“经过硬件后端边界和 adapter 兼容层”的版本，但还不是“真实 MMIO/DMA 硬件后端”。
 
-当前还额外冻结了一个独立 command window，用于后续 RTL queue 模式联调：
+当前还保留了一个独立 command window 地址窗口，作为历史/兼容占位：
 
 - `CMDQ`
 - `CMPQ`
@@ -82,9 +82,11 @@
 需要强调的是：
 
 - 现有 `ACCEL_SHARED` 1MB 不因为 queue 需求而改动
-- command/completion 走独立窗口
-- 默认提交路径仍然保留 legacy 口径
-- queue mode 只是后续可切入的 adapter 内部模式，不会自动替换当前默认路径
+- 当前主线控制面继续采用 `legacy/fixed-job MMIO`
+- command/completion 窗口不再代表当前要推进的 queue 命令硬件
+- 若后续重新讨论 queue 路线，应另起阶段，不自动继承当前默认路径
+
+因此，当前 deploy 主线应理解为：**MMIO 优先，queue 暂不需要。**
 
 ### 3. 共享 RAM / section 当前实现状态
 
@@ -114,7 +116,7 @@
 - `ACCEL_SCRATCH`
 - `ACCEL_TRACE`
 
-此外还新增了独立的 command window 子区域：
+此外还保留了独立的 command window 子区域：
 
 - `ACCEL_CMDQ`
 - `ACCEL_CMPQ`
@@ -138,35 +140,13 @@
   - CPU uncached alias：`0xbc405000 ~ 0xbc405fff`
   - 大小：`4KB`
 
-当前还额外冻结了最小 queue entry 合同：
+这些窗口当前仅保留为地址规划/兼容占位，不再代表当前要推进的 queue 提交主线。
+当前默认控制面不依赖 `CMDQ/CMPQ` ring、doorbell 或 completion 语义。
+如果后续重新恢复 queue 路线，应单独重开规格，而不是默认沿用当前 bring-up 路径。
 
-- `CMDQ entry`
-  - 大小：`32B`
-  - 当前软件/RTL 对齐字段：
-    - `opcode`
-    - `seq_id`
-    - `trace_tag`
-    - `addr`
-    - `len_bytes`
-    - `qos_class`
-    - `stride_en`
-    - `line_size`
-    - `line_stride`
-- `CMPQ entry`
-  - 大小：`16B`
-  - 当前最小字段：
-    - `seq_id`
-    - `status`
-    - `error_code`
-    - `cycles`
-    - `info0`
-
-按当前窗口大小推导出的 ring 容量为：
-
-- `CMDQ depth = 512`
-- `CMPQ depth = 256`
-
-这些合同当前只用于冻结软件/硬件交界面，默认提交路径仍不会自动切到 queue mode。
+换言之：
+- 当前主线 = `legacy/fixed-job MMIO`
+- `CMDQ/CMPQ/DBG2` = 保留地址窗口，不是当前必经控制路径
 
 需要注意：
 
@@ -195,10 +175,15 @@
 python tools/export_deploy_headers.py --model-bin artifacts/stories260K/stories260K_q80.bin --tokenizer-bin artifacts/stories260K/tok512.bin
 ```
 
-导出目标固定为：
+当前 deploy 状态文档默认对齐的 QAT best 资产为：
 
-- `deploy/assets/stories260K_qat_best/stories_data.h`
-- `deploy/assets/stories260K_qat_best/tok512.h`
+- `deploy/assets/qat_best_compare_finalpolishstrong_seq256/stories_data.h`
+- `deploy/assets/qat_best_compare_finalpolishstrong_seq256/tok512.h`
+
+其中：
+
+- `deploy/assets/stories260K_qat_best/` 保留为官方导出基线口径；
+- 本轮 deploy 状态、verify 与默认展示/workload 记录，不再把它写成当前默认 QAT best。
 
 当前导出的头文件已经带有：
 
@@ -255,7 +240,6 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 
 - 经过 `HW_STUB` backend
 - 输出共享区 `ptr/cpu/phys/size` 布局
-- 输出 command window `ptr/cpu/phys/size` 布局
 - 在运行过程中输出 adapter trace
 
 ### 验证版
@@ -274,11 +258,13 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 当前 verify 已覆盖：
 
 - `rmsnorm`
-- `linear_qkv_q`
+- `linear_qkv_q/k/v`
+- `av_matmul`
 - `qk_matmul`
 - `softmax_row`
 - `gate_mul`
 - `residual_add`
+- `kv_main_map`
 
 其中 `qk_matmul` 已不再只是单元素检查，而是覆盖：
 
@@ -288,13 +274,22 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 
 ## 当前默认展示口径
 
-当前内部固定的默认 decode 参数是：
+当前内部固定的默认 decode/workload 真值来自 `deploy/include/runtime_decode_cfg.h`：
 
 - `temperature = 0.93`
 - `top_p = 0.9`
 - `top_k = 40`
 - `repetition_penalty = 1.05`
 - `no_repeat_ngram_size = 3`
+- `max_new_tokens = 140`
+- prompts 固定分为 `stable` / `story` 两组
+
+当前 deploy 状态可概括为：
+
+- `runq_deploy_cpu = SW_REF`
+- `runq_deploy_hw = HW_STUB + runtime_hw_adapter`
+- deploy V1 默认执行主线 = `quantized linears + float attention core`
+- `qk_matmul / softmax_row / av_matmul` 当前仍保持 float 执行语义
 
 ## 当前实现边界
 
@@ -307,8 +302,6 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 - `generate/chat` 前端
 - arena 化 `RunState`
 - 共享区 descriptor / adapter 兼容层
-- command/completion 独立窗口的地址、backing storage 与 getter
-- 最小 `CMDQ/CMPQ` entry 结构体与容量推导
 - 算子级 verify 与 summary 输出
 
 其中 `chat` 当前边界为：
@@ -323,9 +316,11 @@ make runq_deploy_hw DEPLOY_LDFLAGS="-Wl,-T,deploy/ld/deploy_sections.ldh"
 
 - 真实 `HW` backend
 - 真实 MMIO/DMA 寄存器协议接入
-- queue mode 的真实 descriptor / enqueue / completion 协议
 - SoC 主链接脚本对 `deploy_sections.ldh` 的正式接入
 - 当前最佳 QAT 权重的正式部署导出
+
+当前默认控制面继续采用 `legacy/fixed-job MMIO`。
+queue 命令硬件、queue submit/completion 软件路径不再属于这轮主线。
 
 ## 说明
 

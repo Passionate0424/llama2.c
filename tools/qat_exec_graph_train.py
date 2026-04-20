@@ -258,15 +258,23 @@ def build_teacher_corpus_texts(bundle: TeacherBundle, *, device: str) -> List[st
     return texts
 
 
-def freeze_unselected_params(model: nn.Module, *, train_norm_weight: bool) -> None:
-    # 第一版默认只放开最关键的线性层和可选 norm 权重，避免训练自由度过大。
+def freeze_unselected_params(
+    model: nn.Module,
+    *,
+    train_norm_weight: bool,
+    attention_only: bool,
+    train_output_weight: bool,
+) -> None:
+    # 默认先把可训练集合收口到 attention 路径，避免 FFN/分类头一起漂移，便于判断 QK/AV/KV 代理是否有效。
     for name, param in model.named_parameters():
         param.requires_grad = False
-        if ".weight" in name and ("attention." in name or "feed_forward." in name):
+        if ".weight" in name and "attention." in name:
+            param.requires_grad = True
+        elif not attention_only and ".weight" in name and "feed_forward." in name:
             param.requires_grad = True
         if train_norm_weight and name.endswith(".weight") and ("attention_norm" in name or "ffn_norm" in name or name == "norm.weight"):
             param.requires_grad = True
-        if name == "output.weight":
+        if train_output_weight and name == "output.weight":
             param.requires_grad = True
 
 
@@ -291,6 +299,13 @@ def build_model_for_stage(
     rms_scales,
     stage: TrainStage,
     device: str,
+    *,
+    kv_cache_mode: str,
+    qk_score_mode: str,
+    av_out_mode: str,
+    attn_group_size: int,
+    attention_only: bool,
+    train_output_weight: bool,
 ) -> nn.Module:
     # 每个阶段都从同一 student 结构出发，只改变“哪些硬件代理被拉进图里”。
     student, _ = eqs.load_model(ckpt_path, device)
@@ -304,9 +319,18 @@ def build_model_for_stage(
         linear_weight_mode="per_row",
         use_acc32=True,
         use_mid16=True,
+        kv_cache_mode=kv_cache_mode,
+        qk_score_mode=qk_score_mode,
+        av_out_mode=av_out_mode,
+        attn_group_size=attn_group_size,
     )
     student = qx.prepare_qat_model(student, linear_scales, rms_scales, cfg)
-    freeze_unselected_params(student, train_norm_weight=stage.train_norm_weight)
+    freeze_unselected_params(
+        student,
+        train_norm_weight=stage.train_norm_weight,
+        attention_only=attention_only,
+        train_output_weight=train_output_weight,
+    )
     return student
 
 
@@ -981,6 +1005,14 @@ def main():
     parser.add_argument("--mix-teacher-text", action="store_true", help="在真实 custom-512 数据流中混入 teacher 生成文本。")
     parser.add_argument("--save-stage-checkpoints", action="store_true", help="保存每个阶段结束后的 student checkpoint，便于单独做 demo 采样。")
     parser.add_argument("--resume-from", default="", help="从已有 stage checkpoint 继续训练。")
+    parser.add_argument("--student-ckpt", default="", help="显式指定 student 初始 checkpoint；为空时沿用 quant_eval/stories260K.pt")
+    parser.add_argument("--tokenizer-path", default="", help="显式指定 tokenizer.model；为空时沿用 quant_eval/tok512.model")
+    parser.add_argument("--kv-cache-mode", choices=["none", "per_kv_head", "per_row", "group64"], default="none")
+    parser.add_argument("--qk-score-mode", choices=["none", "mid16_token", "mid16_layer"], default="none")
+    parser.add_argument("--av-out-mode", choices=["none", "per_kv_head", "per_row", "group64"], default="none")
+    parser.add_argument("--attn-group-size", type=int, default=64)
+    parser.add_argument("--attention-only", action="store_true", help="只训练 attention.* 权重，避免 FFN 一起漂移。")
+    parser.add_argument("--no-train-output-weight", action="store_true", help="关闭 output.weight 训练，只保留 attention 定向微调。")
     args = parser.parse_args()
 
     device = detect_device(args.device)
@@ -991,8 +1023,9 @@ def main():
     need_42m = "42m" in corpus_teacher_names
     ensure_teacher_artifacts(args.quant_eval_dir, need_42m=need_42m)
 
-    ckpt_path = checkpoint_path(args.quant_eval_dir)
-    student_tokenizer = Tokenizer(tokenizer_model=tokenizer_path(args.quant_eval_dir))
+    ckpt_path = args.student_ckpt if args.student_ckpt else checkpoint_path(args.quant_eval_dir)
+    tok_path = args.tokenizer_path if args.tokenizer_path else tokenizer_path(args.quant_eval_dir)
+    student_tokenizer = Tokenizer(tokenizer_model=tok_path)
 
     # same-vocab teacher 负责 KL / feature 蒸馏，保证训练目标维度完全对齐。
     distill_teacher = load_teacher_bundle(args.distill_teacher, quant_eval_dir=args.quant_eval_dir, device=device)
@@ -1068,6 +1101,14 @@ def main():
             "temperature": args.temperature,
             "eval_interval": args.eval_interval,
             "stage_preset": args.stage_preset,
+            "kv_cache_mode": args.kv_cache_mode,
+            "qk_score_mode": args.qk_score_mode,
+            "av_out_mode": args.av_out_mode,
+            "attn_group_size": args.attn_group_size,
+            "student_ckpt": ckpt_path,
+            "tokenizer_path": tok_path,
+            "attention_only": args.attention_only,
+            "train_output_weight": not args.no_train_output_weight,
         },
         "stages": [],
     }
@@ -1088,6 +1129,12 @@ def main():
                 rms_scales,
                 stage,
                 device,
+                kv_cache_mode=args.kv_cache_mode,
+                qk_score_mode=args.qk_score_mode,
+                av_out_mode=args.av_out_mode,
+                attn_group_size=args.attn_group_size,
+                attention_only=args.attention_only,
+                train_output_weight=not args.no_train_output_weight,
             )
             if resume_state is not None:
                 student.load_state_dict(resume_state, strict=False)
@@ -1100,6 +1147,12 @@ def main():
                 rms_scales,
                 stage,
                 device,
+                kv_cache_mode=args.kv_cache_mode,
+                qk_score_mode=args.qk_score_mode,
+                av_out_mode=args.av_out_mode,
+                attn_group_size=args.attn_group_size,
+                attention_only=args.attention_only,
+                train_output_weight=not args.no_train_output_weight,
             )
             student.load_state_dict(state, strict=False)
 
@@ -1147,7 +1200,11 @@ def main():
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    print(json.dumps(results, ensure_ascii=False, indent=2))
+    try:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    except UnicodeEncodeError:
+        # Windows 控制台可能仍是 GBK；文件已成功写出，这里退化成最小 ASCII 提示，避免把已完成训练误判成失败。
+        print(json.dumps({"output": args.output, "status": "written"}, ensure_ascii=True))
 
 
 if __name__ == "__main__":

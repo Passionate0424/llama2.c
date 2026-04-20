@@ -11,6 +11,15 @@
 // 当前阶段最重要的接口收敛是：
 // - qk_matmul / av_matmul 不再长期接受裸 float* 历史 KV；
 // - runtime 先把历史 KV 收口成 layer view，再由 backend 通过统一解释规则访问。
+//
+// 当前 deploy V1 的算子冻结 / 融合边界：
+// - 执行层默认主线 = quantized linears + float attention core
+// - 已明确收口的融合边界：linear_qkv
+// - 仍保持分算子执行：qk_matmul -> softmax_row -> av_matmul
+// - FFN 仍保持：linear_ffn_w1 / linear_ffn_w3 / gate_mul / linear_ffn_w2
+// - Fusion Preview 候选：rmsnorm / softmax_row
+// - 当前不进入默认执行主线：int qk_matmul / int av_matmul / qk+softmax+av 一体融合
+// - 控制面口径：MMIO 优先，queue 暂不需要
 typedef struct RuntimeBackendOps {
     const char *name;
     int (*init)(RuntimeBackend *backend, RuntimeModel *model);
@@ -18,6 +27,10 @@ typedef struct RuntimeBackendOps {
     void (*destroy)(RuntimeBackend *backend);
 
     // Attention/FFN 主路径算子。
+    // 融合层级约定：
+    // 1) `linear_qkv` 是当前唯一已冻结的执行层融合边界；
+    // 2) `rmsnorm` / `softmax_row` 已前移为 Fusion Preview 候选，但默认执行仍保持独立 float 算子；
+    // 3) `qk_matmul -> softmax_row -> av_matmul` 当前不做一体融合，也不切到 int attention core。
     void (*rmsnorm)(RuntimeBackend *backend, float *out, const float *x, const float *weight, int size);
     void (*linear_qkv)(RuntimeBackend *backend, float *q, float *k, float *v, const float *x, int layer_idx);
     void (*linear_attn_o)(RuntimeBackend *backend, float *out, const float *x, int layer_idx);

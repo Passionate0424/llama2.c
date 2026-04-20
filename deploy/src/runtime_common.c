@@ -20,7 +20,6 @@ __attribute__((section(".runtime_arena"), aligned(64)))
 
 static RuntimeArena g_runtime_arena;
 static int g_runtime_arena_inited = 0;
-static int g_runtime_kv_int8_mode = 0;
 
 int grouped_scale_count(int n, int group_size) {
     if (group_size <= 0 || n <= 0) return 0;
@@ -138,12 +137,9 @@ void runtime_malloc_state(RuntimeState *state, const RuntimeConfig *config, int 
     runtime_refresh_kv_main_regions(state, config);
     runtime_seed_kv_main_regions(state, config, kv_dim);
 
-    // 当前 token 的 k/v 仍保留为过渡 row buffer，方便继续迭代；
-    // 但正式历史路径已经由 view + KV_MAIN region 接管。
+    // 当前 token 的 k/v row buffer 最终会直接提交到 KV_MAIN float 数据面。
     state->key_cache_main_data_region.cpu_ptr = state->key_cache;
     state->value_cache_main_data_region.cpu_ptr = state->value_cache;
-    state->key_cache_main_scale_region.cpu_ptr = NULL;
-    state->value_cache_main_scale_region.cpu_ptr = NULL;
 
     if (!state->x || !state->xb || !state->xb2 || !state->hb || !state->hb2 ||
         !state->xq.q || !state->xq.s || !state->hq.q || !state->hq.s ||
@@ -238,28 +234,30 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each, int gr
 void runtime_init_kv_cache_layer_view(
     RuntimeKvCacheLayerView *view,
     const SharedBufferDesc *data_region,
-    const SharedBufferDesc *scale_region,
-    float *legacy_float_data,
     int seq_len,
     int kv_dim,
     int head_size,
     int kv_mul,
-    size_t data_stride_bytes,
-    size_t scale_stride_bytes
+    size_t data_stride_bytes
 ) {
     if (!view) {
         return;
     }
-    view->data_region = data_region;
-    view->scale_region = scale_region;
-    view->legacy_float_data = legacy_float_data;
+    memset(view, 0, sizeof(*view));
+    memset(&view->data_region_desc, 0, sizeof(view->data_region_desc));
+    if (data_region) {
+        view->data_region_desc = *data_region;
+        view->data_region = &view->data_region_desc;
+    } else {
+        view->data_region = NULL;
+    }
     view->seq_len = seq_len;
     view->kv_dim = kv_dim;
     view->head_size = head_size;
     view->kv_mul = kv_mul;
     view->data_stride_bytes = data_stride_bytes;
-    view->scale_stride_bytes = scale_stride_bytes;
 }
+
 
 size_t runtime_kv_cache_row_data_offset(const RuntimeKvCacheLayerView *view, int time_idx) {
     if (!view || time_idx < 0) {
@@ -268,113 +266,40 @@ size_t runtime_kv_cache_row_data_offset(const RuntimeKvCacheLayerView *view, int
     return (size_t)time_idx * view->data_stride_bytes;
 }
 
-int runtime_kv_cache_uses_int8_data(const RuntimeKvCacheLayerView *view) {
-    return view && runtime_get_kv_int8_mode() && view->data_region && view->data_region->cpu_ptr;
-}
-
-void runtime_set_kv_int8_mode(int enabled) {
-    g_runtime_kv_int8_mode = enabled ? 1 : 0;
-}
-
-int runtime_get_kv_int8_mode(void) {
-    return g_runtime_kv_int8_mode;
-}
-
 void runtime_kv_cache_write_row(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row) {
-    if (!view || !src_row || !view->legacy_float_data) {
-        return;
-    }
-    memcpy(view->legacy_float_data + (size_t)time_idx * (size_t)view->kv_dim,
-           src_row,
-           (size_t)view->kv_dim * sizeof(float));
-}
-
-void runtime_kv_cache_write_row_int8(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row) {
     size_t row_off;
-    int i;
-    unsigned char *dst;
-    float max_abs = 0.0f;
-    float scale;
-
     if (!view || !src_row || !view->data_region || !view->data_region->cpu_ptr) {
         return;
     }
     row_off = runtime_kv_cache_row_data_offset(view, time_idx);
-    dst = (unsigned char *)view->data_region->cpu_ptr + row_off;
-    for (i = 0; i < view->kv_dim; ++i) {
-        float v = fabsf(src_row[i]);
-        if (v > max_abs) max_abs = v;
-    }
-    scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : (1.0f / 127.0f);
-    for (i = 0; i < view->kv_dim; ++i) {
-        ((int8_t *)dst)[i] = (int8_t)roundf(src_row[i] / scale);
-    }
-    if (view->scale_region && view->scale_region->cpu_ptr && view->scale_stride_bytes >= sizeof(float)) {
-        float *scale_dst = (float *)((unsigned char *)view->scale_region->cpu_ptr +
-                                     (size_t)time_idx * view->scale_stride_bytes);
-        *scale_dst = scale;
-    }
-    if (view->legacy_float_data) {
-        memcpy(view->legacy_float_data + (size_t)time_idx * (size_t)view->kv_dim,
-               src_row,
-               (size_t)view->kv_dim * sizeof(float));
-    }
+    memcpy((unsigned char *)view->data_region->cpu_ptr + row_off,
+           src_row,
+           (size_t)view->kv_dim * sizeof(float));
 }
 
-void runtime_kv_cache_read_row_int8(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row) {
+void runtime_kv_cache_extract_row(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row) {
     size_t row_off;
-    const int8_t *src;
-    float scale = 1.0f / 127.0f;
-    int i;
-
     if (!view || !dst_row || !view->data_region || !view->data_region->cpu_ptr) {
         return;
     }
     row_off = runtime_kv_cache_row_data_offset(view, time_idx);
-    src = (const int8_t *)((const unsigned char *)view->data_region->cpu_ptr + row_off);
-    if (view->scale_region && view->scale_region->cpu_ptr && view->scale_stride_bytes >= sizeof(float)) {
-        const float *scale_src = (const float *)((const unsigned char *)view->scale_region->cpu_ptr +
-                                                 (size_t)time_idx * view->scale_stride_bytes);
-        scale = *scale_src;
-    }
-    for (i = 0; i < view->kv_dim; ++i) {
-        dst_row[i] = (float)src[i] * scale;
-    }
-}
-
-void runtime_kv_cache_extract_row(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row) {
-    if (!view || !dst_row) {
-        return;
-    }
-    if (runtime_kv_cache_uses_int8_data(view)) {
-        runtime_kv_cache_read_row_int8(view, time_idx, dst_row);
-        return;
-    }
-    if (view->legacy_float_data) {
-        memcpy(dst_row,
-               view->legacy_float_data + (size_t)time_idx * (size_t)view->kv_dim,
-               (size_t)view->kv_dim * sizeof(float));
-    }
+    memcpy(dst_row,
+           (const unsigned char *)view->data_region->cpu_ptr + row_off,
+           (size_t)view->kv_dim * sizeof(float));
 }
 
 const float *runtime_kv_cache_head_ptr(const RuntimeKvCacheLayerView *view, int time_idx, int head_idx) {
-    static float g_kv_row_scratch[RUNTIME_MODEL_MAX_DIM];
     int kv_head_idx;
-    if (!view || view->kv_mul <= 0) {
+    size_t row_off;
+    if (!view || view->kv_mul <= 0 || !view->data_region || !view->data_region->cpu_ptr) {
         return NULL;
     }
     kv_head_idx = head_idx / view->kv_mul;
-    if (runtime_kv_cache_uses_int8_data(view)) {
-        runtime_kv_cache_extract_row(view, time_idx, g_kv_row_scratch);
-        return g_kv_row_scratch + (size_t)kv_head_idx * (size_t)view->head_size;
-    }
-    if (!view->legacy_float_data) {
-        return NULL;
-    }
-    return view->legacy_float_data +
-           (size_t)time_idx * (size_t)view->kv_dim +
+    row_off = runtime_kv_cache_row_data_offset(view, time_idx);
+    return (const float *)((const unsigned char *)view->data_region->cpu_ptr + row_off) +
            (size_t)kv_head_idx * (size_t)view->head_size;
 }
+
 
 void runtime_refresh_kv_main_regions(RuntimeState *state, const RuntimeConfig *config) {
     int kv_dim;
@@ -387,15 +312,9 @@ void runtime_refresh_kv_main_regions(RuntimeState *state, const RuntimeConfig *c
     state->key_cache_main_data_region.cpu_uncached_addr = RUNTIME_KEY_CACHE_MAIN_DATA_UNC;
     state->key_cache_main_data_region.phys_addr = RUNTIME_KEY_CACHE_MAIN_DATA_PHYS;
     state->key_cache_main_data_region.size = (size_t)config->n_layers * (size_t)config->seq_len * float_bytes_per_row;
-    state->key_cache_main_scale_region.cpu_uncached_addr = RUNTIME_KEY_CACHE_MAIN_SCALE_UNC;
-    state->key_cache_main_scale_region.phys_addr = RUNTIME_KEY_CACHE_MAIN_SCALE_PHYS;
-    state->key_cache_main_scale_region.size = RUNTIME_KEY_CACHE_MAIN_SCALE_SIZE;
     state->value_cache_main_data_region.cpu_uncached_addr = RUNTIME_VALUE_CACHE_MAIN_DATA_UNC;
     state->value_cache_main_data_region.phys_addr = RUNTIME_VALUE_CACHE_MAIN_DATA_PHYS;
     state->value_cache_main_data_region.size = (size_t)config->n_layers * (size_t)config->seq_len * float_bytes_per_row;
-    state->value_cache_main_scale_region.cpu_uncached_addr = RUNTIME_VALUE_CACHE_MAIN_SCALE_UNC;
-    state->value_cache_main_scale_region.phys_addr = RUNTIME_VALUE_CACHE_MAIN_SCALE_PHYS;
-    state->value_cache_main_scale_region.size = RUNTIME_VALUE_CACHE_MAIN_SCALE_SIZE;
 }
 
 void runtime_seed_kv_main_regions(RuntimeState *state, const RuntimeConfig *config, int kv_dim) {
@@ -405,10 +324,8 @@ void runtime_seed_kv_main_regions(RuntimeState *state, const RuntimeConfig *conf
     }
     state->key_cache_main_data_region.cpu_ptr = state->key_cache;
     state->key_cache_main_data_region.size = total_bytes;
-    state->key_cache_main_scale_region.cpu_ptr = NULL;
     state->value_cache_main_data_region.cpu_ptr = state->value_cache;
     state->value_cache_main_data_region.size = total_bytes;
-    state->value_cache_main_scale_region.cpu_ptr = NULL;
 }
 
 int runtime_kv_has_legacy_float_backing(const RuntimeState *state) {
@@ -455,35 +372,48 @@ void runtime_init_layer_kv_views(
     int kv_dim = (config->dim * config->n_kv_heads) / config->n_heads;
     int head_size = config->dim / config->n_heads;
     int kv_mul = config->n_heads / config->n_kv_heads;
-    float *layer_key_cache = runtime_key_cache_layer_ptr(state, layer_idx, config->seq_len, kv_dim);
-    float *layer_value_cache = runtime_value_cache_layer_ptr(state, layer_idx, config->seq_len, kv_dim);
+    const SharedBufferDesc *key_data_region = &state->key_cache_main_data_region;
+    const SharedBufferDesc *value_data_region = &state->value_cache_main_data_region;
+    size_t row_stride_bytes = (size_t)kv_dim * sizeof(float);
+    size_t layer_offset_bytes = (size_t)layer_idx * (size_t)config->seq_len * row_stride_bytes;
+
     runtime_init_kv_cache_layer_view(
         key_view,
-        &state->key_cache_main_data_region,
-        &state->key_cache_main_scale_region,
-        layer_key_cache,
+        key_data_region,
         config->seq_len,
         kv_dim,
         head_size,
         kv_mul,
-        (size_t)kv_dim * sizeof(float),
-        sizeof(float));
+        row_stride_bytes);
     runtime_init_kv_cache_layer_view(
         value_view,
-        &state->value_cache_main_data_region,
-        &state->value_cache_main_scale_region,
-        layer_value_cache,
+        value_data_region,
         config->seq_len,
         kv_dim,
         head_size,
         kv_mul,
-        (size_t)kv_dim * sizeof(float),
-        sizeof(float));
+        row_stride_bytes);
     if (bind_hw_regions) {
-        key_view->data_region = runtime_hw_adapter_key_cache_main_data();
-        key_view->scale_region = runtime_hw_adapter_key_cache_main_scale();
-        value_view->data_region = runtime_hw_adapter_value_cache_main_data();
-        value_view->scale_region = runtime_hw_adapter_value_cache_main_scale();
+        key_data_region = runtime_hw_adapter_key_cache_main_data();
+        value_data_region = runtime_hw_adapter_value_cache_main_data();
+
+        key_view->data_region_desc = *key_data_region;
+        key_view->data_region_desc.cpu_ptr = key_data_region->cpu_ptr ?
+            ((unsigned char *)key_data_region->cpu_ptr + layer_offset_bytes) : NULL;
+        key_view->data_region_desc.cpu_uncached_addr = key_data_region->cpu_uncached_addr + layer_offset_bytes;
+        key_view->data_region_desc.phys_addr = key_data_region->phys_addr + (uint32_t)layer_offset_bytes;
+        key_view->data_region_desc.size = key_data_region->size >= layer_offset_bytes ?
+            (key_data_region->size - layer_offset_bytes) : 0u;
+        key_view->data_region = &key_view->data_region_desc;
+
+        value_view->data_region_desc = *value_data_region;
+        value_view->data_region_desc.cpu_ptr = value_data_region->cpu_ptr ?
+            ((unsigned char *)value_data_region->cpu_ptr + layer_offset_bytes) : NULL;
+        value_view->data_region_desc.cpu_uncached_addr = value_data_region->cpu_uncached_addr + layer_offset_bytes;
+        value_view->data_region_desc.phys_addr = value_data_region->phys_addr + (uint32_t)layer_offset_bytes;
+        value_view->data_region_desc.size = value_data_region->size >= layer_offset_bytes ?
+            (value_data_region->size - layer_offset_bytes) : 0u;
+        value_view->data_region = &value_view->data_region_desc;
     }
 }
 
@@ -496,11 +426,6 @@ void runtime_commit_kv_rows(
     const float *value_row
 ) {
     (void)model;
-    if (runtime_get_kv_int8_mode()) {
-        runtime_kv_cache_write_row_int8(key_view, pos, key_row);
-        runtime_kv_cache_write_row_int8(value_view, pos, value_row);
-        return;
-    }
     runtime_kv_cache_write_row(key_view, pos, key_row);
     runtime_kv_cache_write_row(value_view, pos, value_row);
 }
@@ -550,12 +475,11 @@ void runtime_bind_kv_view_to_hw_regions(RuntimeKvCacheLayerView *view, int is_va
     }
     if (is_value_region) {
         view->data_region = runtime_hw_adapter_value_cache_main_data();
-        view->scale_region = runtime_hw_adapter_value_cache_main_scale();
     } else {
         view->data_region = runtime_hw_adapter_key_cache_main_data();
-        view->scale_region = runtime_hw_adapter_key_cache_main_scale();
     }
 }
+
 
 void rmsnorm_ref(float *out, const float *x, const float *weight, int size) {
     float ss = 0.0f;
@@ -1051,7 +975,10 @@ float *runtime_decode_transformer_step(RuntimeBackend *backend, int token, int p
         RuntimeKvCacheLayerView key_view;
         RuntimeKvCacheLayerView value_view;
 
-        runtime_init_layer_kv_views(model, layer, &key_view, &value_view, 0);
+        runtime_init_layer_kv_views(model, layer, &key_view, &value_view,
+            backend->kind == RUNTIME_BACKEND_HWSTUB);
+        // 当前 deploy V1 主线保持 float attention core；
+        // 这里的 rmsnorm 已前移为 Fusion Preview 候选，但默认执行仍是独立 float 算子。
         backend->ops->rmsnorm(backend, state->xb, state->x, weights->rms_att_weight + layer * dim, dim);
         runtime_linear_qkv_row(backend, state->q, key_cache_row, value_cache_row, state->xb, layer);
 
@@ -1068,6 +995,8 @@ float *runtime_decode_transformer_step(RuntimeBackend *backend, int token, int p
             float *att_head = state->att + h * config->seq_len;
             float *xb_head = state->xb + h * head_size;
             backend->ops->qk_matmul(backend, att_head, state->q, runtime_key_view(&key_view), pos, h);
+            // softmax_row 当前也已进入 Fusion Preview 候选，
+            // 但执行层仍保持 `qk_matmul -> softmax_row -> av_matmul` 的分算子 float 路径。
             backend->ops->softmax_row(backend, att_head, pos + 1);
             backend->ops->av_matmul(backend, xb_head, att_head, runtime_value_view(&value_view), pos, h);
         }
@@ -1075,6 +1004,8 @@ float *runtime_decode_transformer_step(RuntimeBackend *backend, int token, int p
         backend->ops->linear_attn_o(backend, state->xb2, state->xb, layer);
         backend->ops->residual_add(backend, state->x, state->xb2, dim);
 
+        // FFN 前的 rmsnorm 与 attention 前的口径一致：
+        // 已进入 Fusion Preview 候选，但当前默认执行仍保持独立 float 算子。
         backend->ops->rmsnorm(backend, state->xb, state->x, weights->rms_ffn_weight + layer * dim, dim);
         backend->ops->linear_ffn_w1(backend, state->hb, state->xb, layer);
         backend->ops->linear_ffn_w3(backend, state->hb2, state->xb, layer);

@@ -30,6 +30,7 @@
    - scale 粒度
    - 形状信息
 5. V1 先冻结 `LINEAR` 类合同，并形成 `RMSNorm / QK_SCORE / SOFTMAX_AV` 的软件合同原型
+6. 当前 deploy V1 明确采用 `quantized linears + float attention core`：线性层沿用 Python best linear-only checkpoint 导出的 q80 资产，`QK_SCORE / SOFTMAX_AV` 仅保留 float 软件合同，不冻结整数硬件数学
 
 ---
 
@@ -63,6 +64,25 @@
 - `RMSNORM_FINAL`
 
 这些 op 当前仍使用软件浮点 `rmsnorm()` 作为参考数学，但已经纳入 descriptor / mock MMIO / compare 路径。
+在当前阶段，它们可进入 **Fusion Preview / 语义冻结层**，因为 RTL 的 `post_engine` 已经具备 norm 通路基础；但这不等于当前 deploy V1 默认执行已切到 fused/hardware 路径。
+
+### Deploy 实装映射（当前 V1）
+
+当前 `deploy/` 的正式 backend 接口粒度与 coarse-op 术语之间的关系可按下列方式理解：
+
+- `LINEAR_ATTN_Q/K/V` 在 deploy 中收口为单个 `linear_qkv`
+- `LINEAR_ATTN_O` 对应 `linear_attn_o`
+- `LINEAR_FFN_W1/W3/W2` 分别对应 `linear_ffn_w1/w3/w2`
+- `LINEAR_CLS` 对应 `lm_head`
+- `QK_SCORE` 在 deploy 中对应 `qk_matmul`
+- `SOFTMAX_AV` 在 deploy 中拆成 `softmax_row + av_matmul`
+
+也就是说，当前 deploy V1 的已冻结融合边界是：
+- 已融合：`linear_qkv`
+- 未融合：`qk_matmul -> softmax_row -> av_matmul`
+- FFN 仍为 `w1 / w3 / gate_mul / w2` 分算子
+
+这套映射应被视为当前执行层真值；coarse-op 术语继续用于软件/硬件协同设计，但不应反向覆盖 deploy 当前真实边界。
 
 ### `Attention NonLinear` 族
 
@@ -75,6 +95,7 @@
 - `SOFTMAX_AV` 负责对该行 score 做 softmax，并与 value cache 做加权求和
 
 这两类 op 的合同已经形成，但它们仍然是软件 fallback 数学，不等于硬件数学已冻结。
+在当前 deploy V1 中，它们明确保持 float attention core 语义；本轮不引入 int `qk_matmul` / int `av_matmul`，也不做跨 `qk+softmax+av` 的融合冻结。
 
 ---
 

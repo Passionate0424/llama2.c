@@ -5,8 +5,8 @@
 
 #include "runtime_common.h"
 
-// 当前临时切到 seq256 strong 主展示 checkpoint 导出的资产，
-// 用于对齐 Python 展示链并和现有 deploy 结果做对比。
+// deploy 默认绑定到当前确认的 QAT best 资产目录。
+// 这轮状态文档与验证口径统一对齐 `finalpolishstrong_seq256` 导出的头文件资产。
 #include "../assets/qat_best_compare_finalpolishstrong_seq256/stories_data.h"
 #include "../assets/qat_best_compare_finalpolishstrong_seq256/tok512.h"
 

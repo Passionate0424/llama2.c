@@ -44,6 +44,8 @@ static void swref_destroy(RuntimeBackend *backend) {
 
 static void swref_rmsnorm(RuntimeBackend *backend, float *out, const float *x, const float *weight, int size) {
     (void)backend;
+    // 当前仍按独立 float 算子执行；
+    // 这里作为 RMSNorm Fusion Preview 的软件参考数学基线。
     rmsnorm_ref(out, x, weight, size);
 }
 
@@ -87,6 +89,8 @@ static void swref_qk_matmul(RuntimeBackend *backend, float *att, const float *q,
 
 static void swref_softmax_row(RuntimeBackend *backend, float *row, int size) {
     (void)backend;
+    // 当前仍按独立 float 算子执行；
+    // 这里作为 Softmax Fusion Preview 的软件参考数学基线。
     softmax_ref(row, size);
 }
 

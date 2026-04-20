@@ -408,8 +408,9 @@ unsigned char tok512_bin[] = { ... };
 ### 默认模型
 固定为当前最佳主版本：
 - `seq256 + final_polish_strong`
-- 导出后资产目录：
-  - `deploy/assets/stories260K_qat_best/`
+- 当前 deploy 默认对齐的 QAT best 资产目录：
+  - `deploy/assets/qat_best_compare_finalpolishstrong_seq256/`
+- `deploy/assets/stories260K_qat_best/` 保留为官方导出基线口径，不作为当前 deploy 状态文档的默认 QAT best。
 
 ### 默认展示参数
 固定：
@@ -452,12 +453,15 @@ unsigned char tok512_bin[] = { ... };
 
 `runq_verify`
 - 固定执行 `SW_REF -> HW_STUB -> compare`
-- 至少覆盖：
+- 当前对齐后的最小覆盖包括：
   - `rmsnorm`
+  - `linear_qkv_q/k/v`
+  - `av_matmul`
   - `qk_matmul`
   - `softmax_row`
   - `gate_mul`
   - `residual_add`
+  - `kv_main_map`
 
 ---
 

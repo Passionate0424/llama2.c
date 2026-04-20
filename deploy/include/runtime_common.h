@@ -72,33 +72,24 @@ void runtime_apply_rope_to_qk_row(float *q, float *k_row, int dim, int kv_dim, i
 void runtime_load_embedding_row(const RuntimeModel *model, int token, float *out);
 
 // 统一把某一层的历史 KV 暴露成 layer view，避免 backend 继续吃裸 float* 历史 KV。
+// 当前 V1 合同中，KV_MAIN 正式数据面固定为 float row。
 void runtime_init_kv_cache_layer_view(
     RuntimeKvCacheLayerView *view,
     const SharedBufferDesc *data_region,
-    const SharedBufferDesc *scale_region,
-    float *legacy_float_data,
     int seq_len,
     int kv_dim,
     int head_size,
     int kv_mul,
-    size_t data_stride_bytes,
-    size_t scale_stride_bytes
+    size_t data_stride_bytes
 );
 
-// 统一计算某层某时刻的 KV data byte offset，并按 view 解释数据。
+// 统一计算某层某时刻的 KV data byte offset，并按 float row view 解释数据。
 size_t runtime_kv_cache_row_data_offset(const RuntimeKvCacheLayerView *view, int time_idx);
 const float *runtime_kv_cache_head_ptr(const RuntimeKvCacheLayerView *view, int time_idx, int head_idx);
 void runtime_kv_cache_extract_row(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row);
 void runtime_kv_cache_write_row(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row);
-void runtime_kv_cache_write_row_int8(RuntimeKvCacheLayerView *view, int time_idx, const float *src_row);
-void runtime_kv_cache_read_row_int8(const RuntimeKvCacheLayerView *view, int time_idx, float *dst_row);
-int runtime_kv_cache_uses_int8_data(const RuntimeKvCacheLayerView *view);
 
-// 控制运行时是否优先走最小 int8 data 路径；默认关闭，仅作为实验开关。
-void runtime_set_kv_int8_mode(int enabled);
-int runtime_get_kv_int8_mode(void);
-
-// 刷新 RuntimeState 中 KV_MAIN data/scale region 的地址口径。
+// 刷新 RuntimeState 中 KV_MAIN data region 的地址口径。
 void runtime_refresh_kv_main_regions(RuntimeState *state, const RuntimeConfig *config);
 void runtime_seed_kv_main_regions(RuntimeState *state, const RuntimeConfig *config, int kv_dim);
 int runtime_kv_has_legacy_float_backing(const RuntimeState *state);

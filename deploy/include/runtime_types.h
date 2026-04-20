@@ -38,21 +38,18 @@ typedef struct {
 } SharedBufferDesc;
 
 // KV 访问视图：
-// 1) 先把 backend 对历史 KV 的正式输入从裸 float* 收口成 view；
-// 2) 当前阶段仍允许用 legacy_float_data 绑定旧的 float backing，便于逐步迁移；
-// 3) 后续切到 KV_MAIN int8 data + scale metadata 时，优先替换 view 的解释逻辑，
-//    而不是再次修改 backend 算子签名。
+// 1) backend 对历史 KV 的正式输入统一收口成 view；
+// 2) 当前 V1 合同中，KV_MAIN 正式数据面固定为 float row；
+// 3) 若后续要重新引入 KV 量化，应在新合同下扩展 view，而不是复用本轮已冻结接口。
 typedef struct {
+    // view 自带一份 region 描述副本，避免调用方只能引用外部临时对象。
+    SharedBufferDesc data_region_desc;
     const SharedBufferDesc *data_region;
-    const SharedBufferDesc *scale_region;
-    // 迁移期保留的 float backing，仅供 SW_REF/HW_STUB 与旧验证路径复用。
-    float *legacy_float_data;
     int seq_len;
     int kv_dim;
     int head_size;
     int kv_mul;
     size_t data_stride_bytes;
-    size_t scale_stride_bytes;
 } RuntimeKvCacheLayerView;
 
 typedef struct {
@@ -94,15 +91,12 @@ typedef struct {
     float *att;
     // 最终 lm_head 输出的 logits。
     float *logits;
-    // 完整历史 KV 的旧 float backing。
-    // 当前只允许作为迁移期内部存储，不允许继续作为 backend/verify 的正式裸指针合同。
+    // 完整历史 KV 的 float backing，也是当前 V1 的正式 KV_MAIN 数据面。
     float *key_cache;
     float *value_cache;
-    // KV_MAIN 一级窗口下的二级子区描述对象。
+    // KV_MAIN 一级窗口下的正式 data region 描述对象。
     SharedBufferDesc key_cache_main_data_region;
-    SharedBufferDesc key_cache_main_scale_region;
     SharedBufferDesc value_cache_main_data_region;
-    SharedBufferDesc value_cache_main_scale_region;
 } RuntimeState;
 
 typedef struct {

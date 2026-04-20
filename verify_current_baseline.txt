@@ -1,0 +1,24 @@
+[HW_STUB] rmsnorm
+[VERIFY] rmsnorm        max=0.000000 mean=0.000000 mismatch=0/64 tol=0.000010 PASS
+[HW_STUB] linear_qkv
+[HW_ADAPTER] op=linear_qkv layer=0 elems=64 in_cpu=0xbc280000 out_cpu=0xbc2a0000 in_phys=0x1c280000 out_phys=0x1c2a0000
+[HW_ADAPTER] submit job_kind=linear
+[HW_ADAPTER] queue_shadow op=linear_qkv layer=0 seq_id=1 trace_tag=1 cmdq_slot=0 cmd_count=1
+[HW_ADAPTER] completion seq_id=1 status=1 error=0 cycles=0 info0=1
+[VERIFY] linear_qkv_q   max=0.000000 mean=0.000000 mismatch=0/64 tol=0.000010 PASS
+[HW_STUB] qk_matmul
+[HW_ADAPTER] op=qk_matmul layer=3 elems=4 in_cpu=0xbc280000 out_cpu=0xbc2a0000 in_phys=0x1c280000 out_phys=0x1c2a0000
+[VERIFY] kv_int8_row    max=0.003887 mean=0.001618 mismatch=0/32 tol=0.250000 PASS
+[VERIFY] qk_matmul      max=0.000000 mean=0.000000 mismatch=0/4 tol=0.000010 PASS
+[VERIFY] kv_main_map    max=0.000000 mean=0.000000 mismatch=0/4 tol=0.000010 PASS
+[HW_STUB] softmax_row
+[HW_ADAPTER] op=softmax_row layer=0 elems=4 in_cpu=0xbc280000 out_cpu=0xbc2a0000 in_phys=0x1c280000 out_phys=0x1c2a0000
+[VERIFY] softmax_row    max=0.000000 mean=0.000000 mismatch=0/4 tol=0.000010 PASS
+[HW_STUB] gate_mul
+[HW_ADAPTER] op=gate_mul layer=0 elems=172 in_cpu=0xbc280000 out_cpu=0xbc2a0000 in_phys=0x1c280000 out_phys=0x1c2a0000
+[VERIFY] gate_mul       max=0.000000 mean=0.000000 mismatch=0/172 tol=0.000010 PASS
+[HW_STUB] residual_add
+[HW_ADAPTER] op=residual_add layer=0 elems=64 in_cpu=0xbc280000 out_cpu=0xbc2a0000 in_phys=0x1c280000 out_phys=0x1c2a0000
+[VERIFY] residual_add   max=0.000000 mean=0.000000 mismatch=0/64 tol=0.000010 PASS
+[VERIFY] queue_shadow   max=0.000000 mean=0.000000 mismatch=0/4 tol=0.000010 PASS
+[VERIFY] summary total=9 failed=0 status=PASS
